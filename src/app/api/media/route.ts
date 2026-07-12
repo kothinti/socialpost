@@ -3,9 +3,9 @@ import fs from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
 import { getSession } from "@/lib/auth";
+import { getUploadsDir } from "@/lib/db";
 import { jsonError, jsonOk, unauthorized } from "@/lib/http";
 
-const UPLOAD_DIR = path.join(/*turbopackIgnore: true*/ process.cwd(), "data", "uploads");
 const ALLOWED = new Set([
   "image/jpeg",
   "image/png",
@@ -30,16 +30,17 @@ export async function POST(req: NextRequest) {
     return jsonError("File too large (max 15MB for this app)");
   }
 
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  const uploadDir = getUploadsDir();
+  fs.mkdirSync(uploadDir, { recursive: true });
   const ext = path.extname(file.name) || mimeExt(file.type);
   const filename = `${Date.now()}-${randomUUID()}${ext}`;
-  const relative = path.join("data", "uploads", filename);
-  const absolute = path.join(/*turbopackIgnore: true*/ process.cwd(), relative);
+  const absolute = path.join(uploadDir, filename);
 
   const buffer = Buffer.from(await file.arrayBuffer());
   fs.writeFileSync(absolute, buffer);
 
-  return jsonOk({ path: relative, filename, type: file.type, size: file.size });
+  // Store filename-only so publish can resolve against getUploadsDir() on any host.
+  return jsonOk({ path: filename, filename, type: file.type, size: file.size });
 }
 
 function mimeExt(type: string) {

@@ -1,5 +1,4 @@
 import { NextRequest } from "next/server";
-import path from "path";
 import { getSession } from "@/lib/auth";
 import {
   createDraft,
@@ -122,14 +121,11 @@ export async function PATCH(req: NextRequest) {
   }
 
   try {
-    const mediaPaths = (body.data.media_paths ?? draft.media_paths).map((p) =>
-      path.isAbsolute(p) ? p : path.join(/*turbopackIgnore: true*/ process.cwd(), p),
-    );
     const content = body.data.content ?? draft.content;
     const xPostId = await publishPost({
       text: content,
       replyToId: draft.type === "reply" ? draft.reply_to_x_id : null,
-      mediaPaths,
+      mediaPaths: body.data.media_paths ?? draft.media_paths,
     });
 
     const updated = await updateDraft(draft.id, {
