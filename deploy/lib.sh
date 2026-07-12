@@ -25,11 +25,12 @@ load_config() {
     exit 1
   fi
   APP_PORT="${APP_PORT:-3000}"
-  GIT_REPO="${GIT_REPO:-https://github.com/kothinti/socialpost.git}"
+  GIT_REPO="${GIT_REPO:-git@github.com:kothinti/socialpost.git}"
   GIT_BRANCH="${GIT_BRANCH:-main}"
   CRON_SCHEDULE="${CRON_SCHEDULE:-0 9 * * *}"
+  WEB_SERVER="${WEB_SERVER:-auto}"
 
-  export DEPLOY_USER APP_DIR DOMAIN APP_PORT GIT_REPO GIT_BRANCH CRON_SCHEDULE
+  export DEPLOY_USER APP_DIR DOMAIN APP_PORT GIT_REPO GIT_BRANCH CRON_SCHEDULE WEB_SERVER
 }
 
 require_command() {
@@ -117,6 +118,30 @@ install_systemd() {
   echo "systemd service installed: socialpost"
 }
 
+detect_web_server() {
+  if [[ "$WEB_SERVER" != "auto" ]]; then
+    echo "$WEB_SERVER"
+    return
+  fi
+  if command -v apache2ctl >/dev/null 2>&1; then
+    if systemctl is-active --quiet apache2 2>/dev/null; then
+      echo apache
+      return
+    fi
+  fi
+  if command -v nginx >/dev/null 2>&1; then
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+      echo nginx
+      return
+    fi
+  fi
+  if command -v apache2ctl >/dev/null 2>&1; then
+    echo apache
+    return
+  fi
+  echo nginx
+}
+
 install_nginx_site() {
   require_command nginx
   local available="/etc/nginx/sites-available/socialpost"
@@ -133,6 +158,34 @@ install_nginx_site() {
   sudo nginx -t
   sudo systemctl reload nginx
   echo "nginx site enabled for $DOMAIN"
+}
+
+install_apache_site() {
+  require_command apache2ctl
+  sudo a2enmod proxy proxy_http rewrite headers >/dev/null
+
+  bash "$DEPLOY_DIR/render.sh" \
+    "$DEPLOY_DIR/apache-socialpost.conf.tpl" \
+    "/tmp/socialpost.apache"
+
+  sudo cp "/tmp/socialpost.apache" "/etc/apache2/sites-available/socialpost.conf"
+  sudo a2ensite socialpost.conf >/dev/null
+  sudo apache2ctl configtest
+  sudo systemctl reload apache2
+  echo "Apache site enabled for $DOMAIN"
+}
+
+install_web_server() {
+  local ws
+  ws="$(detect_web_server)"
+  case "$ws" in
+    apache) install_apache_site ;;
+    nginx) install_nginx_site ;;
+    *)
+      echo "Unknown WEB_SERVER=$ws (use apache, nginx, or auto)" >&2
+      exit 1
+      ;;
+  esac
 }
 
 install_cron() {

@@ -19,6 +19,7 @@ echo "    user:   $DEPLOY_USER"
 echo "    app:    $APP_DIR"
 echo "    domain: $DOMAIN"
 echo "    port:   $APP_PORT"
+echo "    web:    $(detect_web_server)"
 echo
 
 ensure_build_deps
@@ -27,8 +28,12 @@ ensure_app_checkout
 ensure_env_file
 build_app
 install_systemd
-install_nginx_site
+install_web_server
 install_cron
+
+WS="$(detect_web_server)"
+CERTBOT_FLAVOR=nginx
+[[ "$WS" == "apache" ]] && CERTBOT_FLAVOR=apache
 
 echo
 echo "Install complete."
@@ -36,7 +41,7 @@ echo
 echo "Next steps:"
 echo "  1. Point DNS for $DOMAIN to this droplet."
 echo "  2. Enable HTTPS:"
-echo "       sudo certbot --nginx -d $DOMAIN"
+echo "       sudo certbot --$CERTBOT_FLAVOR -d $DOMAIN"
 echo "  3. Open https://$DOMAIN and create your account."
 echo "  4. In Settings, set OAuth callback to:"
 echo "       https://$DOMAIN/api/auth/x/callback"
