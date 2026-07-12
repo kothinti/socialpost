@@ -11,3 +11,7 @@ export function jsonError(message: string, status = 400) {
 export function unauthorized() {
   return jsonError("Unauthorized", 401);
 }
+
+export function forbidden() {
+  return jsonError("Forbidden", 403);
+}

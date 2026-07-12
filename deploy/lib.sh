@@ -65,7 +65,7 @@ ensure_node_20() {
 }
 
 ensure_build_deps() {
-  echo "Installing build dependencies for better-sqlite3..."
+  echo "Installing build dependencies..."
   sudo apt-get update
   sudo apt-get install -y build-essential python3 git
 }
@@ -93,7 +93,7 @@ ensure_env_file() {
       sed -i "s|CRON_SECRET=.*|CRON_SECRET=$cron_secret|" "$APP_DIR/.env.local"
     fi
     echo "Created $APP_DIR/.env.local with random secrets."
-    echo "Set APP_URL=https://$DOMAIN in .env.local before using OAuth."
+    echo "Set APP_URL=https://$DOMAIN and MONGODB_URI in .env.local before starting."
   fi
 
   if grep -q '^APP_URL=http://localhost' "$APP_DIR/.env.local" 2>/dev/null; then

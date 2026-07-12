@@ -74,7 +74,7 @@ export default function LoginPage() {
         </p>
         <p className="muted mb-8 text-sm">
           {mode === "setup"
-            ? "Create your solo account to get started."
+            ? "Create the admin account to get started. Later users are added by an admin."
             : "Sign in to continue."}
         </p>
 
@@ -110,7 +110,7 @@ export default function LoginPage() {
           ) : null}
 
           <button className="btn btn-primary w-full mt-2" disabled={busy} type="submit">
-            {busy ? "Working…" : mode === "setup" ? "Create account" : "Sign in"}
+            {busy ? "Working…" : mode === "setup" ? "Create admin account" : "Sign in"}
           </button>
         </form>
       </div>

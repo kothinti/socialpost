@@ -1,8 +1,8 @@
 import OpenAI from "openai";
 import { getSettings } from "./db";
 
-function getClient() {
-  const s = getSettings();
+async function getClient() {
+  const s = await getSettings();
   if (!s.openai_api_key) throw new Error("OpenAI API key is not configured");
   return {
     client: new OpenAI({ apiKey: s.openai_api_key }),
@@ -16,7 +16,7 @@ export async function composeReply(opts: {
   authorHandle: string;
   instruction?: string;
 }) {
-  const { client, model, settings } = getClient();
+  const { client, model, settings } = await getClient();
   const system =
     settings.reply_system_prompt ||
     `You write concise, natural replies for X (Twitter). Stay under 280 characters unless asked otherwise. Match a thoughtful, human voice. No hashtags unless asked. Do not wrap the reply in quotes.`;
@@ -48,7 +48,7 @@ export async function composeReply(opts: {
 export async function composeOriginal(opts: {
   prompt: string;
 }) {
-  const { client, model, settings } = getClient();
+  const { client, model, settings } = await getClient();
   const system =
     settings.compose_system_prompt ||
     `You write original posts for X (Twitter). Default to under 280 characters unless the user asks for a thread or longer. Sound human and specific. Avoid corporate filler and unnecessary hashtags. Do not wrap the post in quotes.`;

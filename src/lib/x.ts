@@ -2,12 +2,24 @@ import { ApiResponseError, TwitterApi, EUploadMimeType } from "twitter-api-v2";
 import fs from "fs";
 import path from "path";
 import {
-  getDb,
+  deleteFetchedPostById,
+  deleteOldFetchedPosts,
   getSettings,
-  parseJsonArray,
+  listFetchedPostsSince,
   saveOAuthTokens,
+  updateSettings,
+  upsertFetchedPost,
   type FetchedPost,
+  type Settings,
 } from "./db";
+import {
+  buildTopicSearchQuery,
+  passesFeedFilters,
+} from "./feed-filters";
+import {
+  feedFiltersFromSettings,
+  getFeedFilterSettings,
+} from "./feed-settings";
 
 export const X_OAUTH_SCOPES = [
   "tweet.read",
@@ -40,10 +52,9 @@ export function formatXError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-export function defaultRedirectUri(reqOrigin?: string) {
-  const s = getSettings();
+export async function defaultRedirectUri(reqOrigin?: string) {
+  const s = await getSettings();
   if (s.x_redirect_uri?.trim()) return s.x_redirect_uri.trim();
-  // X prefers 127.0.0.1 over localhost for local callbacks
   if (reqOrigin) {
     try {
       const u = new URL(reqOrigin);
@@ -56,8 +67,8 @@ export function defaultRedirectUri(reqOrigin?: string) {
   return "http://127.0.0.1:3000/api/auth/x/callback";
 }
 
-function getOAuth2AppClient() {
-  const s = getSettings();
+async function getOAuth2AppClient() {
+  const s = await getSettings();
   if (!s.x_api_key || !s.x_api_secret) {
     throw new Error("X Client ID and Client Secret are required");
   }
@@ -67,9 +78,8 @@ function getOAuth2AppClient() {
   });
 }
 
-/** Read timelines with app Bearer when available. */
-function getReadClient() {
-  const s = getSettings();
+async function getReadClient() {
+  const s = await getSettings();
   if (s.x_bearer_token) {
     return new TwitterApi(s.x_bearer_token.trim());
   }
@@ -82,7 +92,7 @@ function getReadClient() {
 }
 
 async function ensureFreshUserToken(): Promise<string> {
-  const s = getSettings();
+  const s = await getSettings();
   if (!s.x_access_token) {
     throw new Error(
       "Not connected to X. Save Client ID + Client Secret, then click Connect with X.",
@@ -101,9 +111,9 @@ async function ensureFreshUserToken(): Promise<string> {
     return s.x_access_token.trim();
   }
 
-  const app = getOAuth2AppClient();
+  const app = await getOAuth2AppClient();
   const refreshed = await app.refreshOAuth2Token(s.x_access_secret.trim());
-  saveOAuthTokens({
+  await saveOAuthTokens({
     accessToken: refreshed.accessToken,
     refreshToken: refreshed.refreshToken ?? s.x_access_secret,
     expiresIn: refreshed.expiresIn,
@@ -116,8 +126,8 @@ async function getWriteClient() {
   return new TwitterApi(token);
 }
 
-export function createOAuth2Link(redirectUri: string) {
-  const client = getOAuth2AppClient();
+export async function createOAuth2Link(redirectUri: string) {
+  const client = await getOAuth2AppClient();
   return client.generateOAuth2AuthLink(redirectUri, {
     scope: [...X_OAUTH_SCOPES],
   });
@@ -128,7 +138,7 @@ export async function completeOAuth2Login(opts: {
   codeVerifier: string;
   redirectUri: string;
 }) {
-  const client = getOAuth2AppClient();
+  const client = await getOAuth2AppClient();
   const result = await client.loginWithOAuth2({
     code: opts.code,
     codeVerifier: opts.codeVerifier,
@@ -143,20 +153,12 @@ export async function completeOAuth2Login(opts: {
     /* optional */
   }
 
-  saveOAuthTokens({
+  await saveOAuthTokens({
     accessToken: result.accessToken,
     refreshToken: result.refreshToken,
     expiresIn: result.expiresIn,
     handle: handle ?? null,
   });
-
-  if (handle) {
-    getDb()
-      .prepare(
-        `UPDATE settings SET own_handle = CASE WHEN own_handle = '' OR own_handle IS NULL THEN ? ELSE own_handle END WHERE id = 1`,
-      )
-      .run(handle);
-  }
 
   return { handle, accessToken: result.accessToken };
 }
@@ -173,9 +175,7 @@ export async function verifyXWriteAuth(): Promise<{
       return { ok: false, message: "X returned no user for these credentials" };
     }
     if (me.data.username) {
-      getDb()
-        .prepare(`UPDATE settings SET x_connected_handle = ? WHERE id = 1`)
-        .run(me.data.username);
+      await updateSettings({ x_connected_handle: me.data.username });
     }
     return {
       ok: true,
@@ -218,42 +218,65 @@ function mimeForFile(filePath: string): {
   }
 }
 
+type UpsertPostRow = {
+  x_post_id: string;
+  author_id: string | null;
+  author_handle: string;
+  author_name: string | null;
+  content: string;
+  media_urls: string[];
+  like_count: number;
+  reply_count: number;
+  repost_count: number;
+  posted_at: string | null;
+};
+
 export async function fetchWatchedPostsLast24h(): Promise<{
   inserted: number;
   scanned: number;
+  skipped: number;
   handles: string[];
+  topic_search: boolean;
+  search_query: string | null;
 }> {
-  const settings = getSettings();
-  const handles = parseJsonArray(settings.watched_handles)
+  const settings = await getSettings();
+  const filters = feedFiltersFromSettings(settings);
+  const handles = (settings.watched_handles ?? [])
     .map((h) => h.replace(/^@/, "").trim())
     .filter(Boolean);
 
-  if (handles.length === 0) {
-    return { inserted: 0, scanned: 0, handles: [] };
+  const searchQuery =
+    filters.enable_topic_search && filters.topic_keywords.length > 0
+      ? buildTopicSearchQuery(filters)
+      : null;
+
+  if (handles.length === 0 && !searchQuery) {
+    return {
+      inserted: 0,
+      scanned: 0,
+      skipped: 0,
+      handles: [],
+      topic_search: false,
+      search_query: null,
+    };
   }
 
-  const client = getReadClient().readOnly;
+  const client = (await getReadClient()).readOnly;
   const since = hoursAgoISO(24);
-  const db = getDb();
-  const upsert = db.prepare(`
-    INSERT INTO fetched_posts (
-      x_post_id, author_id, author_handle, author_name, content, media_urls,
-      like_count, reply_count, repost_count, posted_at, fetched_at
-    ) VALUES (
-      @x_post_id, @author_id, @author_handle, @author_name, @content, @media_urls,
-      @like_count, @reply_count, @repost_count, @posted_at, datetime('now')
-    )
-    ON CONFLICT(x_post_id) DO UPDATE SET
-      content = excluded.content,
-      media_urls = excluded.media_urls,
-      like_count = excluded.like_count,
-      reply_count = excluded.reply_count,
-      repost_count = excluded.repost_count,
-      fetched_at = datetime('now')
-  `);
 
   let inserted = 0;
   let scanned = 0;
+  let skipped = 0;
+
+  const tryUpsert = async (row: UpsertPostRow) => {
+    scanned += 1;
+    if (!passesFeedFilters(row, filters)) {
+      skipped += 1;
+      return;
+    }
+    const changed = await upsertFetchedPost(row);
+    if (changed) inserted += 1;
+  };
 
   try {
     for (const handle of handles) {
@@ -283,36 +306,96 @@ export async function fetchWatchedPostsLast24h(): Promise<{
       }
 
       for (const tweet of timeline.tweets) {
-        scanned += 1;
         const mediaKeys = tweet.attachments?.media_keys ?? [];
         const mediaUrls = mediaKeys
           .map((k) => mediaByKey.get(k))
           .filter((u): u is string => Boolean(u));
 
-        const info = upsert.run({
+        await tryUpsert({
           x_post_id: tweet.id,
           author_id: user.data.id,
           author_handle: user.data.username,
           author_name: user.data.name,
           content: tweet.text,
-          media_urls: JSON.stringify(mediaUrls),
+          media_urls: mediaUrls,
           like_count: tweet.public_metrics?.like_count ?? 0,
           reply_count: tweet.public_metrics?.reply_count ?? 0,
           repost_count: tweet.public_metrics?.retweet_count ?? 0,
           posted_at: tweet.created_at ?? null,
         });
-        if (info.changes > 0) inserted += 1;
+      }
+    }
+
+    if (searchQuery) {
+      const search = await client.v2.search(searchQuery, {
+        max_results: 50,
+        start_time: since,
+        "tweet.fields": [
+          "created_at",
+          "public_metrics",
+          "attachments",
+          "author_id",
+        ],
+        expansions: ["author_id", "attachments.media_keys"],
+        "user.fields": ["username", "name"],
+        "media.fields": ["url", "preview_image_url", "type"],
+      });
+
+      const mediaByKey = new Map<string, string>();
+      for (const m of search.includes?.media ?? []) {
+        const url = m.url || m.preview_image_url;
+        if (url && m.media_key) mediaByKey.set(m.media_key, url);
+      }
+
+      const usersById = new Map<string, { username: string; name?: string }>();
+      for (const u of search.includes?.users ?? []) {
+        if (u.id && u.username) {
+          usersById.set(u.id, { username: u.username, name: u.name });
+        }
+      }
+
+      for (const tweet of search.tweets) {
+        const author = tweet.author_id ? usersById.get(tweet.author_id) : undefined;
+        const mediaKeys = tweet.attachments?.media_keys ?? [];
+        const mediaUrls = mediaKeys
+          .map((k) => mediaByKey.get(k))
+          .filter((u): u is string => Boolean(u));
+
+        await tryUpsert({
+          x_post_id: tweet.id,
+          author_id: tweet.author_id ?? null,
+          author_handle: author?.username ?? "unknown",
+          author_name: author?.name ?? null,
+          content: tweet.text,
+          media_urls: mediaUrls,
+          like_count: tweet.public_metrics?.like_count ?? 0,
+          reply_count: tweet.public_metrics?.reply_count ?? 0,
+          repost_count: tweet.public_metrics?.retweet_count ?? 0,
+          posted_at: tweet.created_at ?? null,
+        });
       }
     }
   } catch (err) {
     throw new Error(formatXError(err));
   }
 
-  db.prepare(
-    `DELETE FROM fetched_posts WHERE posted_at IS NOT NULL AND posted_at < datetime('now', '-48 hours')`,
-  ).run();
+  await deleteOldFetchedPosts(48);
 
-  return { inserted, scanned, handles };
+  const stale = await listFetchedPostsSince(24, 500);
+  for (const row of stale) {
+    if (!passesFeedFilters(row, filters)) {
+      await deleteFetchedPostById(row.id);
+    }
+  }
+
+  return {
+    inserted,
+    scanned,
+    skipped,
+    handles,
+    topic_search: Boolean(searchQuery),
+    search_query: searchQuery,
+  };
 }
 
 export async function uploadMediaFiles(absolutePaths: string[]): Promise<string[]> {
@@ -379,12 +462,10 @@ export async function publishPost(opts: {
   }
 }
 
-export function listFeed(limit = 100): FetchedPost[] {
-  return getDb()
-    .prepare(
-      `SELECT * FROM fetched_posts
-       WHERE posted_at IS NULL OR posted_at >= datetime('now', '-24 hours')
-       ORDER BY posted_at DESC LIMIT ?`,
-    )
-    .all(limit) as FetchedPost[];
+export async function listFeed(limit = 100): Promise<FetchedPost[]> {
+  const filters = await getFeedFilterSettings();
+  const rows = await listFetchedPostsSince(24, Math.max(limit * 3, 100));
+  return rows.filter((row) => passesFeedFilters(row, filters)).slice(0, limit);
 }
+
+export type { Settings };
