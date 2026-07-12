@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getSession } from "@/lib/auth";
+import { requireAdmin } from "@/lib/auth";
 import { completeOAuth2Login, formatXError } from "@/lib/x";
 
 export async function GET(req: NextRequest) {
-  const session = await getSession();
+  const session = await requireAdmin();
   if (!session) {
     return NextResponse.redirect(new URL("/login", req.url));
   }

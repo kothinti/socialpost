@@ -1,11 +1,11 @@
 # SocialPost
 
-Personal one-pager for watching X handles, drafting AI replies/posts, and posting or scheduling to your own account.
+Personal workspace for watching X handles / topics, drafting AI replies/posts, and posting or scheduling to a shared X account.
 
 ## Stack
 
 - Next.js (App Router) + TypeScript + Tailwind
-- SQLite (`data/socialpost.db`)
+- MongoDB (`MONGODB_URI`)
 - X API (pay-per-usage) via `twitter-api-v2`
 - OpenAI Chat Completions
 
@@ -13,11 +13,21 @@ Personal one-pager for watching X handles, drafting AI replies/posts, and postin
 
 ```bash
 cp .env.example .env.local
+# set MONGODB_URI, AUTH_SECRET, CRON_SECRET
 npm install
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000), create your solo account, then fill **Settings**:
+Open [http://localhost:3000](http://localhost:3000). The first account becomes **admin**. Additional users are created by an admin (no public signup).
+
+### Roles
+
+| Role | Access |
+| --- | --- |
+| `admin` | Settings, X/OpenAI credentials, feed filters, user management, plus posting |
+| `posting` | Feed, Compose, Queue only (shared workspace) |
+
+Fill **Settings** (admin):
 
 | Field | Purpose |
 | --- | --- |
@@ -27,6 +37,9 @@ Open [http://localhost:3000](http://localhost:3000), create your solo account, t
 | Callback URL | Must match X console (`http://127.0.0.1:3000/api/auth/x/callback`) |
 | OpenAI API Key + model | Compose replies and original posts |
 | Watched handles | Accounts to pull (last 24h), one per line |
+| Topic keywords | Exact-phrase (or loose) filters; optional X recent search |
+| Min likes / replies / reposts | Drop low-engagement posts before they hit the feed |
+| Users | Create admin or posting accounts |
 | Your handle | Display only |
 
 ### X OAuth 2.0 setup
@@ -41,9 +54,7 @@ Open [http://localhost:3000](http://localhost:3000), create your solo account, t
 
 ## Daily jobs
 
-Scheduling is local: drafts are stored in SQLite and posted when due.
-
-Run once a day (and optionally more often for schedules):
+Scheduling is local to MongoDB drafts and posted when due.
 
 ```bash
 # every day at 9:00 — fetch last 24h + flush due schedules
@@ -56,10 +67,10 @@ Or while signed in, call `POST /api/cron` / use **Refresh now** on the Feed tab.
 
 ## App flow
 
-1. **Feed** — posts from watched handles (24h). Select one to reply.
+1. **Feed** — posts from watched handles and/or topic search (24h), filtered by keywords + engagement. Select one to reply.
 2. **Compose** — AI-assisted original posts to your handle; attach media (upload, no generation).
 3. **Queue** — drafts, scheduled items, failures; post or delete.
-4. **Settings** — keys, model, handles, optional system prompts.
+4. **Settings** (admin) — keys, model, handles, filters, users, optional system prompts.
 
 ## Scripts
 
@@ -71,6 +82,7 @@ Or while signed in, call `POST /api/cron` / use **Refresh now** on the Feed tab.
 
 ## Notes
 
-- Solo login only (one account).
-- Secrets are stored in SQLite on disk; keep `data/` private.
+- Shared workspace: one X connection, one feed, one draft queue.
+- Secrets live in MongoDB settings; keep your DB private.
 - Media uploads live in `data/uploads/` (max 15MB in-app).
+- Switching from SQLite: start fresh with MongoDB (no automatic migration).

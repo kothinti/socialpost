@@ -1,14 +1,22 @@
 import { SignJWT, jwtVerify } from "jose";
 import { cookies } from "next/headers";
 import bcrypt from "bcryptjs";
-import { getDb } from "./db";
+import {
+  countUsers,
+  findUserById,
+  type UserRole,
+} from "./db";
 
 const COOKIE = "sp_session";
 const SECRET = new TextEncoder().encode(
   process.env.AUTH_SECRET || "socialpost-dev-secret-change-me",
 );
 
-export type SessionUser = { id: number; email: string };
+export type SessionUser = {
+  id: string;
+  email: string;
+  role: UserRole;
+};
 
 export async function hashPassword(password: string) {
   return bcrypt.hash(password, 12);
@@ -19,9 +27,9 @@ export async function verifyPassword(password: string, hash: string) {
 }
 
 export async function createSession(user: SessionUser) {
-  const token = await new SignJWT({ email: user.email })
+  const token = await new SignJWT({ email: user.email, role: user.role })
     .setProtectedHeader({ alg: "HS256" })
-    .setSubject(String(user.id))
+    .setSubject(user.id)
     .setIssuedAt()
     .setExpirationTime("30d")
     .sign(SECRET);
@@ -48,27 +56,41 @@ export async function getSession(): Promise<SessionUser | null> {
 
   try {
     const { payload } = await jwtVerify(token, SECRET);
-    const id = Number(payload.sub);
+    const id = String(payload.sub || "");
     const email = String(payload.email || "");
     if (!id || !email) return null;
 
-    const row = getDb()
-      .prepare("SELECT id, email FROM users WHERE id = ?")
-      .get(id) as { id: number; email: string } | undefined;
+    const row = await findUserById(id);
+    if (!row || !row.active) return null;
 
-    return row ?? null;
+    return {
+      id: row._id.toHexString(),
+      email: row.email,
+      role: row.role,
+    };
   } catch {
     return null;
   }
 }
 
-export function userExists() {
-  const row = getDb().prepare("SELECT id FROM users WHERE id = 1").get();
-  return Boolean(row);
+export async function hasUsers() {
+  return (await countUsers()) > 0;
+}
+
+/** @deprecated use hasUsers() */
+export async function userExists() {
+  return hasUsers();
 }
 
 export async function requireSession() {
   const session = await getSession();
   if (!session) throw new Error("UNAUTHORIZED");
+  return session;
+}
+
+export async function requireAdmin() {
+  const session = await getSession();
+  if (!session) return null;
+  if (session.role !== "admin") return null;
   return session;
 }

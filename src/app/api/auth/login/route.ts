@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
-import { createSession, userExists, verifyPassword } from "@/lib/auth";
-import { getDb } from "@/lib/db";
+import { createSession, hasUsers, verifyPassword } from "@/lib/auth";
+import { findUserByEmail } from "@/lib/db";
 import { jsonError, jsonOk } from "@/lib/http";
 import { z } from "zod";
 
@@ -10,23 +10,26 @@ const schema = z.object({
 });
 
 export async function POST(req: NextRequest) {
-  if (!userExists()) {
-    return jsonError("No account yet. Create one first.", 404);
+  if (!(await hasUsers())) {
+    return jsonError("No account yet. Create the admin account first.", 404);
   }
 
   const body = schema.safeParse(await req.json());
   if (!body.success) return jsonError("Email and password required");
 
-  const user = getDb()
-    .prepare("SELECT id, email, password_hash FROM users WHERE email = ?")
-    .get(body.data.email.toLowerCase()) as
-    | { id: number; email: string; password_hash: string }
-    | undefined;
-
-  if (!user || !(await verifyPassword(body.data.password, user.password_hash))) {
+  const user = await findUserByEmail(body.data.email);
+  if (
+    !user ||
+    !user.active ||
+    !(await verifyPassword(body.data.password, user.passwordHash))
+  ) {
     return jsonError("Invalid email or password", 401);
   }
 
-  await createSession({ id: user.id, email: user.email });
-  return jsonOk({ ok: true });
+  await createSession({
+    id: user._id.toHexString(),
+    email: user.email,
+    role: user.role,
+  });
+  return jsonOk({ ok: true, role: user.role });
 }

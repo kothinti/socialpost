@@ -1,34 +1,26 @@
 import { NextRequest } from "next/server";
 import path from "path";
 import { getSession } from "@/lib/auth";
-import { getDb, parseJsonArray, type Draft } from "@/lib/db";
+import {
+  createDraft,
+  deleteDraft,
+  findDraftById,
+  listDrafts,
+  updateDraft,
+  type Draft,
+} from "@/lib/db";
 import { jsonError, jsonOk, unauthorized } from "@/lib/http";
-import { toSqliteUtc } from "@/lib/time";
+import { toIsoUtc } from "@/lib/time";
 import { publishPost } from "@/lib/x";
 import { z } from "zod";
 
 function serialize(d: Draft) {
-  return {
-    ...d,
-    media_paths: parseJsonArray(d.media_paths),
-  };
+  return d;
 }
 
 export async function GET() {
   if (!(await getSession())) return unauthorized();
-  const drafts = getDb()
-    .prepare(
-      `SELECT * FROM drafts
-       ORDER BY
-         CASE status
-           WHEN 'scheduled' THEN 0
-           WHEN 'draft' THEN 1
-           WHEN 'failed' THEN 2
-           ELSE 3
-         END,
-         COALESCE(scheduled_at, updated_at) DESC`,
-    )
-    .all() as Draft[];
+  const drafts = await listDrafts();
   return jsonOk({ drafts: drafts.map(serialize) });
 }
 
@@ -44,7 +36,8 @@ const createSchema = z.object({
 });
 
 export async function POST(req: NextRequest) {
-  if (!(await getSession())) return unauthorized();
+  const session = await getSession();
+  if (!session) return unauthorized();
 
   const body = createSchema.safeParse(await req.json());
   if (!body.success) return jsonError("Invalid draft");
@@ -59,36 +52,26 @@ export async function POST(req: NextRequest) {
   }
 
   const scheduledAt = body.data.scheduled_at
-    ? toSqliteUtc(body.data.scheduled_at)
+    ? toIsoUtc(body.data.scheduled_at)
     : null;
 
-  const info = getDb()
-    .prepare(
-      `INSERT INTO drafts (
-        type, reply_to_x_id, reply_to_handle, reply_to_content,
-        content, media_paths, status, scheduled_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
-    )
-    .run(
-      body.data.type,
-      body.data.reply_to_x_id ?? null,
-      body.data.reply_to_handle ?? null,
-      body.data.reply_to_content ?? null,
-      body.data.content,
-      JSON.stringify(body.data.media_paths ?? []),
-      status,
-      scheduledAt,
-    );
-
-  const draft = getDb()
-    .prepare("SELECT * FROM drafts WHERE id = ?")
-    .get(info.lastInsertRowid) as Draft;
+  const draft = await createDraft({
+    type: body.data.type,
+    content: body.data.content,
+    reply_to_x_id: body.data.reply_to_x_id ?? null,
+    reply_to_handle: body.data.reply_to_handle ?? null,
+    reply_to_content: body.data.reply_to_content ?? null,
+    media_paths: body.data.media_paths ?? [],
+    status,
+    scheduled_at: scheduledAt,
+    created_by_user_id: session.id,
+  });
 
   return jsonOk({ draft: serialize(draft) });
 }
 
 const actionSchema = z.object({
-  id: z.number(),
+  id: z.string(),
   action: z.enum(["update", "schedule", "post", "delete"]),
   content: z.string().optional(),
   media_paths: z.array(z.string()).optional(),
@@ -101,48 +84,46 @@ export async function PATCH(req: NextRequest) {
   const body = actionSchema.safeParse(await req.json());
   if (!body.success) return jsonError("Invalid request");
 
-  const db = getDb();
-  const draft = db
-    .prepare("SELECT * FROM drafts WHERE id = ?")
-    .get(body.data.id) as Draft | undefined;
+  const draft = await findDraftById(body.data.id);
   if (!draft) return jsonError("Draft not found", 404);
 
   if (body.data.action === "delete") {
-    db.prepare("DELETE FROM drafts WHERE id = ?").run(body.data.id);
+    await deleteDraft(body.data.id);
     return jsonOk({ ok: true });
   }
 
   if (body.data.action === "update" || body.data.action === "schedule") {
     const content = body.data.content ?? draft.content;
-    const media = body.data.media_paths ?? parseJsonArray(draft.media_paths);
+    const media = body.data.media_paths ?? draft.media_paths;
     let scheduledAt: string | null =
       body.data.scheduled_at === undefined
         ? draft.scheduled_at
         : body.data.scheduled_at
-          ? toSqliteUtc(body.data.scheduled_at)
+          ? toIsoUtc(body.data.scheduled_at)
           : null;
 
     if (body.data.action === "schedule") {
       if (!body.data.scheduled_at) return jsonError("scheduled_at required");
-      scheduledAt = toSqliteUtc(body.data.scheduled_at);
+      scheduledAt = toIsoUtc(body.data.scheduled_at);
     }
 
     const nextStatus =
       body.data.action === "schedule" || scheduledAt ? "scheduled" : "draft";
 
-    db.prepare(
-      `UPDATE drafts SET content = ?, media_paths = ?,
-       status = ?, scheduled_at = ?, error = NULL, updated_at = datetime('now')
-       WHERE id = ?`,
-    ).run(content, JSON.stringify(media), nextStatus, scheduledAt, draft.id);
+    const updated = await updateDraft(draft.id, {
+      content,
+      media_paths: media,
+      status: nextStatus,
+      scheduled_at: scheduledAt,
+      error: null,
+    });
 
-    const updated = db.prepare("SELECT * FROM drafts WHERE id = ?").get(draft.id) as Draft;
-    return jsonOk({ draft: serialize(updated) });
+    return jsonOk({ draft: serialize(updated!) });
   }
 
   try {
-    const mediaPaths = (body.data.media_paths ?? parseJsonArray(draft.media_paths)).map(
-      (p) => (path.isAbsolute(p) ? p : path.join(/*turbopackIgnore: true*/ process.cwd(), p)),
+    const mediaPaths = (body.data.media_paths ?? draft.media_paths).map((p) =>
+      path.isAbsolute(p) ? p : path.join(/*turbopackIgnore: true*/ process.cwd(), p),
     );
     const content = body.data.content ?? draft.content;
     const xPostId = await publishPost({
@@ -151,24 +132,20 @@ export async function PATCH(req: NextRequest) {
       mediaPaths,
     });
 
-    db.prepare(
-      `UPDATE drafts SET content = ?, media_paths = ?, status = 'posted',
-       posted_at = datetime('now'), x_post_id = ?, error = NULL,
-       scheduled_at = NULL, updated_at = datetime('now') WHERE id = ?`,
-    ).run(
+    const updated = await updateDraft(draft.id, {
       content,
-      JSON.stringify(body.data.media_paths ?? parseJsonArray(draft.media_paths)),
-      xPostId,
-      draft.id,
-    );
+      media_paths: body.data.media_paths ?? draft.media_paths,
+      status: "posted",
+      posted_at: new Date().toISOString(),
+      x_post_id: xPostId,
+      error: null,
+      scheduled_at: null,
+    });
 
-    const updated = db.prepare("SELECT * FROM drafts WHERE id = ?").get(draft.id) as Draft;
-    return jsonOk({ draft: serialize(updated) });
+    return jsonOk({ draft: serialize(updated!) });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    db.prepare(
-      `UPDATE drafts SET status = 'failed', error = ?, updated_at = datetime('now') WHERE id = ?`,
-    ).run(message, draft.id);
+    await updateDraft(draft.id, { status: "failed", error: message });
     return jsonError(message, 500);
   }
 }

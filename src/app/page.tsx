@@ -5,7 +5,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 type Tab = "feed" | "compose" | "queue" | "settings";
 
 type FeedPost = {
-  id: number;
+  id: string;
   x_post_id: string;
   author_handle: string;
   author_name: string | null;
@@ -18,7 +18,7 @@ type FeedPost = {
 };
 
 type Draft = {
-  id: number;
+  id: string;
   type: "reply" | "original";
   reply_to_x_id: string | null;
   reply_to_handle: string | null;
@@ -39,6 +39,12 @@ type Settings = {
   own_handle: string;
   reply_system_prompt: string;
   compose_system_prompt: string;
+  topic_keywords: string[];
+  keyword_exact_match: boolean;
+  min_like_count: number;
+  min_reply_count: number;
+  min_repost_count: number;
+  enable_topic_search: boolean;
   has_x_client_id: boolean;
   has_x_client_secret: boolean;
   has_x_bearer_token: boolean;
@@ -46,6 +52,21 @@ type Settings = {
   has_openai_api_key: boolean;
   x_connected_handle: string;
   x_redirect_uri: string;
+  read_only?: boolean;
+};
+
+type SessionUser = {
+  id: string;
+  email: string;
+  role: "admin" | "posting";
+};
+
+type AppUser = {
+  id: string;
+  email: string;
+  role: "admin" | "posting";
+  active: boolean;
+  created_at: string;
 };
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
@@ -91,6 +112,13 @@ export default function HomePage() {
   const [posts, setPosts] = useState<FeedPost[]>([]);
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
+  const [sessionUser, setSessionUser] = useState<SessionUser | null>(null);
+  const [users, setUsers] = useState<AppUser[]>([]);
+  const [newUser, setNewUser] = useState({
+    email: "",
+    password: "",
+    role: "posting" as "admin" | "posting",
+  });
   const [selected, setSelected] = useState<FeedPost | null>(null);
   const [composerMode, setComposerMode] = useState<"reply" | "original">("reply");
   const [content, setContent] = useState("");
@@ -102,6 +130,7 @@ export default function HomePage() {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [handlesText, setHandlesText] = useState("");
+  const [keywordsText, setKeywordsText] = useState("");
   const [settingsForm, setSettingsForm] = useState({
     openai_model: "gpt-4o-mini",
     own_handle: "",
@@ -112,18 +141,26 @@ export default function HomePage() {
     openai_api_key: "",
     reply_system_prompt: "",
     compose_system_prompt: "",
+    keyword_exact_match: true,
+    min_like_count: 0,
+    min_reply_count: 0,
+    min_repost_count: 0,
+    enable_topic_search: false,
   });
 
   const loadAll = useCallback(async () => {
-    const [feed, draftData, settingsData] = await Promise.all([
+    const [feed, draftData, settingsData, me] = await Promise.all([
       api<{ posts: FeedPost[] }>("/api/feed"),
       api<{ drafts: Draft[] }>("/api/drafts"),
       api<Settings>("/api/settings"),
+      api<{ authenticated: boolean; user: SessionUser | null }>("/api/auth/me"),
     ]);
     setPosts(feed.posts);
     setDrafts(draftData.drafts);
     setSettings(settingsData);
+    setSessionUser(me.user);
     setHandlesText(settingsData.watched_handles.map((h) => `@${h}`).join("\n"));
+    setKeywordsText(settingsData.topic_keywords.join("\n"));
     setSettingsForm((prev) => ({
       ...prev,
       openai_model: settingsData.openai_model,
@@ -131,7 +168,21 @@ export default function HomePage() {
       x_redirect_uri: settingsData.x_redirect_uri,
       reply_system_prompt: settingsData.reply_system_prompt,
       compose_system_prompt: settingsData.compose_system_prompt,
+      keyword_exact_match: settingsData.keyword_exact_match,
+      min_like_count: settingsData.min_like_count,
+      min_reply_count: settingsData.min_reply_count,
+      min_repost_count: settingsData.min_repost_count,
+      enable_topic_search: settingsData.enable_topic_search,
     }));
+
+    if (me.user?.role === "admin") {
+      try {
+        const usersData = await api<{ users: AppUser[] }>("/api/users");
+        setUsers(usersData.users);
+      } catch {
+        setUsers([]);
+      }
+    }
   }, []);
 
   useEffect(() => {
@@ -295,7 +346,7 @@ export default function HomePage() {
     }
   }
 
-  async function draftAction(id: number, action: "post" | "delete") {
+  async function draftAction(id: string, action: "post" | "delete") {
     setBusy(`draft-${id}`);
     setError(null);
     try {
@@ -325,6 +376,15 @@ export default function HomePage() {
           .split(/[\n,]+/)
           .map((h) => h.trim())
           .filter(Boolean),
+        topic_keywords: keywordsText
+          .split("\n")
+          .map((k) => k.trim())
+          .filter(Boolean),
+        keyword_exact_match: settingsForm.keyword_exact_match,
+        min_like_count: Number(settingsForm.min_like_count) || 0,
+        min_reply_count: Number(settingsForm.min_reply_count) || 0,
+        min_repost_count: Number(settingsForm.min_repost_count) || 0,
+        enable_topic_search: settingsForm.enable_topic_search,
         reply_system_prompt: settingsForm.reply_system_prompt,
         compose_system_prompt: settingsForm.compose_system_prompt,
       };
@@ -342,6 +402,7 @@ export default function HomePage() {
         body: JSON.stringify(payload),
       });
       setSettings(updated);
+      setKeywordsText(updated.topic_keywords.join("\n"));
       setSettingsForm((prev) => ({
         ...prev,
         x_client_id: "",
@@ -349,6 +410,11 @@ export default function HomePage() {
         x_bearer_token: "",
         openai_api_key: "",
         x_redirect_uri: updated.x_redirect_uri,
+        keyword_exact_match: updated.keyword_exact_match,
+        min_like_count: updated.min_like_count,
+        min_reply_count: updated.min_reply_count,
+        min_repost_count: updated.min_repost_count,
+        enable_topic_search: updated.enable_topic_search,
       }));
       flash("Settings saved");
     } catch (err) {
@@ -376,6 +442,49 @@ export default function HomePage() {
     }
   }
 
+  async function createAppUser() {
+    setBusy("create-user");
+    setError(null);
+    try {
+      await api("/api/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(newUser),
+      });
+      setNewUser({ email: "", password: "", role: "posting" });
+      await loadAll();
+      flash("User created");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not create user");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function patchAppUser(
+    id: string,
+    patch: { active?: boolean; role?: "admin" | "posting" },
+  ) {
+    setBusy(`user-${id}`);
+    setError(null);
+    try {
+      await api("/api/users", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, ...patch }),
+      });
+      await loadAll();
+      flash("User updated");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not update user");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const isAdmin = sessionUser?.role === "admin";
+  const activeTab = !isAdmin && tab === "settings" ? "feed" : tab;
+
   function connectX() {
     window.location.href = "/api/auth/x/start";
   }
@@ -401,6 +510,14 @@ export default function HomePage() {
             </p>
           </div>
           <div className="flex items-center gap-2">
+            {sessionUser ? (
+              <span
+                className="muted text-sm px-3 py-1.5 rounded-full border"
+                style={{ borderColor: "var(--border-strong)" }}
+              >
+                {sessionUser.email} · {sessionUser.role}
+              </span>
+            ) : null}
             {settings?.own_handle ? (
               <span
                 className="muted text-sm px-3 py-1.5 rounded-full border"
@@ -421,7 +538,7 @@ export default function HomePage() {
               ["feed", "Feed"],
               ["compose", "Compose"],
               ["queue", "Queue"],
-              ["settings", "Settings"],
+              ...(isAdmin ? [["settings", "Settings"] as const] : []),
             ] as const
           ).map(([id, label]) => (
             <button
@@ -433,7 +550,7 @@ export default function HomePage() {
                 if (id === "compose") setComposerMode("original");
               }}
               style={
-                tab === id
+                activeTab === id
                   ? { background: "var(--accent)", color: "var(--accent-ink)" }
                   : {
                       background: "transparent",
@@ -454,7 +571,7 @@ export default function HomePage() {
           </div>
         )}
 
-        {tab === "feed" && (
+        {activeTab === "feed" && (
           <section className="grid lg:grid-cols-[1.1fr_0.9fr] gap-4">
             <div className="panel p-4 md:p-5">
               <div className="flex items-center justify-between gap-3 mb-4">
@@ -462,7 +579,31 @@ export default function HomePage() {
                   <h2 className="text-lg" style={{ fontFamily: "var(--font-syne), sans-serif" }}>
                     Last 24 hours
                   </h2>
-                  <p className="muted text-sm">From your watched handles</p>
+                  <p className="muted text-sm">
+                    {settings?.topic_keywords?.length ||
+                    (settings &&
+                      (settings.min_like_count > 0 ||
+                        settings.min_reply_count > 0 ||
+                        settings.min_repost_count > 0))
+                      ? [
+                          settings.topic_keywords.length
+                            ? `${settings.topic_keywords.length} keyword${settings.topic_keywords.length === 1 ? "" : "s"}${settings.keyword_exact_match ? " (exact)" : ""}`
+                            : null,
+                          settings.min_like_count > 0
+                            ? `≥${settings.min_like_count} likes`
+                            : null,
+                          settings.min_reply_count > 0
+                            ? `≥${settings.min_reply_count} replies`
+                            : null,
+                          settings.min_repost_count > 0
+                            ? `≥${settings.min_repost_count} reposts`
+                            : null,
+                          settings.enable_topic_search ? "topic search on" : null,
+                        ]
+                          .filter(Boolean)
+                          .join(" · ")
+                      : "From your watched handles"}
+                  </p>
                 </div>
                 <button
                   className="btn btn-ghost"
@@ -477,7 +618,7 @@ export default function HomePage() {
               <div className="space-y-2 max-h-[70vh] overflow-auto pr-1">
                 {posts.length === 0 ? (
                   <p className="muted text-sm py-10 text-center">
-                    No posts yet. Add handles in Settings, then refresh.
+                    No posts yet. Add handles or topic keywords in Settings, then refresh.
                   </p>
                 ) : (
                   posts.map((post) => (
@@ -531,7 +672,7 @@ export default function HomePage() {
           </section>
         )}
 
-        {tab === "compose" && (
+        {activeTab === "compose" && (
           <section className="max-w-2xl">
             <Composer
               mode="original"
@@ -558,7 +699,7 @@ export default function HomePage() {
           </section>
         )}
 
-        {tab === "queue" && (
+        {activeTab === "queue" && (
           <section className="panel p-4 md:p-5">
             <h2 className="text-lg mb-1" style={{ fontFamily: "var(--font-syne), sans-serif" }}>
               Queue
@@ -625,7 +766,7 @@ export default function HomePage() {
           </section>
         )}
 
-        {tab === "settings" && settings && (
+        {activeTab === "settings" && settings && isAdmin && (
           <section className="panel p-4 md:p-6 max-w-3xl space-y-6">
             <div>
               <h2 className="text-lg" style={{ fontFamily: "var(--font-syne), sans-serif" }}>
@@ -664,6 +805,121 @@ export default function HomePage() {
                 placeholder={"@elonmusk\n@openai"}
               />
             </label>
+
+            <div className="space-y-4">
+              <div>
+                <h3 className="text-sm" style={{ fontFamily: "var(--font-syne), sans-serif" }}>
+                  Feed filters
+                </h3>
+                <p className="muted text-sm mt-1">
+                  Keep the feed tight so you are not paying X to surface low-signal posts.
+                  Keywords and engagement gates drop posts before they are stored. Topic
+                  search pushes phrase + engagement operators into the X recent-search
+                  query (one call), which is usually cheaper than watching many handles.
+                </p>
+              </div>
+
+              <label className="space-y-1.5 block">
+                <span className="text-sm muted">Topic keywords (one phrase per line)</span>
+                <textarea
+                  className="field min-h-24"
+                  value={keywordsText}
+                  onChange={(e) => setKeywordsText(e.target.value)}
+                  placeholder={"AI agents\nopen source LLM"}
+                />
+              </label>
+
+              <div className="flex flex-col gap-3">
+                <label className="flex items-start gap-2.5 text-sm cursor-pointer">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={settingsForm.keyword_exact_match}
+                    onChange={(e) =>
+                      setSettingsForm({
+                        ...settingsForm,
+                        keyword_exact_match: e.target.checked,
+                      })
+                    }
+                  />
+                  <span>
+                    Exact phrase match
+                    <span className="muted block text-xs mt-0.5">
+                      On: post must contain the full phrase. Off: every word in the phrase
+                      may appear in any order.
+                    </span>
+                  </span>
+                </label>
+                <label className="flex items-start gap-2.5 text-sm cursor-pointer">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={settingsForm.enable_topic_search}
+                    onChange={(e) =>
+                      setSettingsForm({
+                        ...settingsForm,
+                        enable_topic_search: e.target.checked,
+                      })
+                    }
+                  />
+                  <span>
+                    Also search X for these topics
+                    <span className="muted block text-xs mt-0.5">
+                      Uses recent search with quoted phrases and min engagement operators.
+                      Requires keywords above. Works with or without watched handles.
+                    </span>
+                  </span>
+                </label>
+              </div>
+
+              <div className="grid grid-cols-3 gap-3">
+                <label className="space-y-1.5 block">
+                  <span className="text-sm muted">Min likes</span>
+                  <input
+                    className="field"
+                    type="number"
+                    min={0}
+                    value={settingsForm.min_like_count}
+                    onChange={(e) =>
+                      setSettingsForm({
+                        ...settingsForm,
+                        min_like_count: Math.max(0, Number(e.target.value) || 0),
+                      })
+                    }
+                  />
+                </label>
+                <label className="space-y-1.5 block">
+                  <span className="text-sm muted">Min replies</span>
+                  <input
+                    className="field"
+                    type="number"
+                    min={0}
+                    value={settingsForm.min_reply_count}
+                    onChange={(e) =>
+                      setSettingsForm({
+                        ...settingsForm,
+                        min_reply_count: Math.max(0, Number(e.target.value) || 0),
+                      })
+                    }
+                  />
+                </label>
+                <label className="space-y-1.5 block">
+                  <span className="text-sm muted">Min reposts</span>
+                  <input
+                    className="field"
+                    type="number"
+                    min={0}
+                    value={settingsForm.min_repost_count}
+                    onChange={(e) =>
+                      setSettingsForm({
+                        ...settingsForm,
+                        min_repost_count: Math.max(0, Number(e.target.value) || 0),
+                      })
+                    }
+                  />
+                </label>
+              </div>
+            </div>
 
             <div>
               <p className="text-sm muted mb-3">
@@ -742,6 +998,110 @@ export default function HomePage() {
                 }
               />
             </label>
+
+            <div className="space-y-4">
+              <div>
+                <h3 className="text-sm" style={{ fontFamily: "var(--font-syne), sans-serif" }}>
+                  Users
+                </h3>
+                <p className="muted text-sm mt-1">
+                  Admin-only. Create posting users who can use Feed / Compose / Queue on the
+                  shared X workspace. They cannot change settings or manage users.
+                </p>
+              </div>
+
+              <div className="grid md:grid-cols-[1.2fr_1fr_auto_auto] gap-3 items-end">
+                <label className="space-y-1.5 block">
+                  <span className="text-sm muted">Email</span>
+                  <input
+                    className="field"
+                    type="email"
+                    value={newUser.email}
+                    onChange={(e) => setNewUser({ ...newUser, email: e.target.value })}
+                    placeholder="teammate@example.com"
+                  />
+                </label>
+                <label className="space-y-1.5 block">
+                  <span className="text-sm muted">Password</span>
+                  <input
+                    className="field"
+                    type="password"
+                    value={newUser.password}
+                    onChange={(e) => setNewUser({ ...newUser, password: e.target.value })}
+                    placeholder="8+ characters"
+                  />
+                </label>
+                <label className="space-y-1.5 block">
+                  <span className="text-sm muted">Role</span>
+                  <select
+                    className="field"
+                    value={newUser.role}
+                    onChange={(e) =>
+                      setNewUser({
+                        ...newUser,
+                        role: e.target.value as "admin" | "posting",
+                      })
+                    }
+                  >
+                    <option value="posting">posting</option>
+                    <option value="admin">admin</option>
+                  </select>
+                </label>
+                <button
+                  className="btn btn-ghost"
+                  type="button"
+                  onClick={createAppUser}
+                  disabled={busy === "create-user" || !newUser.email || newUser.password.length < 8}
+                >
+                  {busy === "create-user" ? "Creating…" : "Add user"}
+                </button>
+              </div>
+
+              <div className="space-y-2">
+                {users.length === 0 ? (
+                  <p className="muted text-sm">No users loaded.</p>
+                ) : (
+                  users.map((u) => (
+                    <div
+                      key={u.id}
+                      className="flex flex-wrap items-center justify-between gap-3 py-2 border-b"
+                      style={{ borderColor: "var(--border)" }}
+                    >
+                      <div>
+                        <p className="text-sm">{u.email}</p>
+                        <p className="muted text-xs">
+                          {u.role}
+                          {u.active ? "" : " · inactive"}
+                          {u.id === sessionUser?.id ? " · you" : ""}
+                        </p>
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          className="btn btn-ghost text-sm"
+                          type="button"
+                          disabled={busy === `user-${u.id}`}
+                          onClick={() =>
+                            patchAppUser(u.id, {
+                              role: u.role === "admin" ? "posting" : "admin",
+                            })
+                          }
+                        >
+                          Make {u.role === "admin" ? "posting" : "admin"}
+                        </button>
+                        <button
+                          className="btn btn-ghost text-sm"
+                          type="button"
+                          disabled={busy === `user-${u.id}`}
+                          onClick={() => patchAppUser(u.id, { active: !u.active })}
+                        >
+                          {u.active ? "Deactivate" : "Activate"}
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
 
             <div className="flex flex-wrap gap-2">
               <button

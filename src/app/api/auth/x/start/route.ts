@@ -1,19 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getSession } from "@/lib/auth";
+import { requireAdmin } from "@/lib/auth";
 import { createOAuth2Link, defaultRedirectUri, formatXError } from "@/lib/x";
 
 export async function GET(req: NextRequest) {
-  const session = await getSession();
+  const session = await requireAdmin();
   if (!session) {
     return NextResponse.redirect(new URL("/login", req.url));
   }
 
   try {
-    const redirectUri = defaultRedirectUri(req.nextUrl.origin);
+    const redirectUri = await defaultRedirectUri(req.nextUrl.origin);
     const callbackOrigin = new URL(redirectUri).origin;
     const currentOrigin = req.nextUrl.origin;
 
-    // Cookies for PKCE must be set on the same host X will redirect to
     if (callbackOrigin !== currentOrigin) {
       return NextResponse.redirect(
         new URL(
@@ -25,7 +24,7 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    const { url, codeVerifier, state } = createOAuth2Link(redirectUri);
+    const { url, codeVerifier, state } = await createOAuth2Link(redirectUri);
 
     const res = NextResponse.redirect(url);
     const cookieOpts = {
