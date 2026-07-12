@@ -1,4 +1,3 @@
-import path from "path";
 import {
   listDueDrafts,
   logJob,
@@ -33,9 +32,7 @@ export async function processDueSchedules() {
       const xPostId = await publishPost({
         text: draft.content,
         replyToId: draft.type === "reply" ? draft.reply_to_x_id : null,
-        mediaPaths: mediaPaths.map((p) =>
-          path.isAbsolute(p) ? p : path.join(/*turbopackIgnore: true*/ process.cwd(), p),
-        ),
+        mediaPaths,
       });
 
       await updateDraft(draft.id, {

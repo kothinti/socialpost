@@ -5,6 +5,7 @@ import {
   deleteFetchedPostById,
   deleteOldFetchedPosts,
   getSettings,
+  getUploadsDir,
   listFetchedPostsSince,
   saveOAuthTokens,
   updateSettings,
@@ -419,6 +420,15 @@ export async function uploadMediaFiles(absolutePaths: string[]): Promise<string[
   return mediaIds;
 }
 
+function resolveMediaPath(p: string) {
+  if (path.isAbsolute(p)) return p;
+  // New uploads store bare filenames; older drafts may store data/uploads/...
+  const base = path.basename(p);
+  const inUploads = path.join(getUploadsDir(), base);
+  if (fs.existsSync(inUploads)) return inUploads;
+  return path.join(/*turbopackIgnore: true*/ process.cwd(), p);
+}
+
 export async function publishPost(opts: {
   text: string;
   replyToId?: string | null;
@@ -426,9 +436,7 @@ export async function publishPost(opts: {
 }): Promise<string> {
   try {
     const client = await getWriteClient();
-    const absolute = (opts.mediaPaths ?? []).map((p) =>
-      path.isAbsolute(p) ? p : path.join(/*turbopackIgnore: true*/ process.cwd(), p),
-    );
+    const absolute = (opts.mediaPaths ?? []).map(resolveMediaPath);
     const mediaIds = await uploadMediaFiles(absolute);
 
     if (mediaIds.length > 4) {

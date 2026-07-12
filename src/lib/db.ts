@@ -2,9 +2,28 @@ import { MongoClient, ObjectId, type Collection, type Db } from "mongodb";
 import fs from "fs";
 import path from "path";
 
-const DATA_DIR = path.join(/*turbopackIgnore: true*/ process.cwd(), "data");
-fs.mkdirSync(DATA_DIR, { recursive: true });
-fs.mkdirSync(path.join(DATA_DIR, "uploads"), { recursive: true });
+/** On Vercel/serverless the app filesystem is read-only; use /tmp for uploads. */
+export function getDataDir() {
+  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    return path.join("/tmp", "socialpost-data");
+  }
+  return path.join(/*turbopackIgnore: true*/ process.cwd(), "data");
+}
+
+export function getUploadsDir() {
+  return path.join(getDataDir(), "uploads");
+}
+
+function ensureDataDirs() {
+  try {
+    fs.mkdirSync(getDataDir(), { recursive: true });
+    fs.mkdirSync(getUploadsDir(), { recursive: true });
+  } catch {
+    // Vercel build / read-only hosts: dirs are created lazily on upload.
+  }
+}
+
+ensureDataDirs();
 
 const SETTINGS_ID = "app";
 
