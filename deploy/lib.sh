@@ -46,15 +46,18 @@ node_major_version() {
 }
 
 ensure_node_20() {
-  require_command node
-  local major
-  major="$(node_major_version)"
-  if [[ "$major" -ge 20 ]]; then
-    echo "Node $(node -v) OK"
-    return
+  if command -v node >/dev/null 2>&1; then
+    local major
+    major="$(node_major_version)"
+    if [[ "$major" -ge 20 ]]; then
+      echo "Node $(node -v) OK"
+      return
+    fi
+    echo "Node 20+ required (found $(node -v)). Installing via NodeSource..."
+  else
+    echo "Node not found. Installing Node 20 via NodeSource..."
   fi
 
-  echo "Node 20+ required (found $(node -v 2>/dev/null || echo none)). Installing via NodeSource..."
   require_command curl
   curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
   sudo apt-get install -y nodejs
