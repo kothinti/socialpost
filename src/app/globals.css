@@ -1,0 +1,154 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #050505;
+  --bg-elevated: #0c0c0c;
+  --bg-soft: #111111;
+  --border: #1f1f1f;
+  --border-strong: #2a2a2a;
+  --text: #f4f4f4;
+  --muted: #8b8b8b;
+  --accent: #d6ff4b;
+  --accent-ink: #0a0a0a;
+  --danger: #ff6b6b;
+  --ok: #7dffb3;
+}
+
+@theme inline {
+  --color-background: var(--bg);
+  --color-foreground: var(--text);
+  --font-sans: var(--font-outfit);
+  --font-display: var(--font-syne);
+  --font-mono: var(--font-ibm);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  background:
+    radial-gradient(1200px 600px at 10% -10%, #14180a 0%, transparent 55%),
+    radial-gradient(900px 500px at 100% 0%, #0d1210 0%, transparent 50%),
+    var(--bg);
+  color: var(--text);
+  font-family: var(--font-outfit), sans-serif;
+}
+
+::selection {
+  background: color-mix(in oklab, var(--accent) 40%, black);
+  color: var(--text);
+}
+
+input,
+textarea,
+button,
+select {
+  font: inherit;
+}
+
+.panel {
+  background: color-mix(in oklab, var(--bg-elevated) 92%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+}
+
+.field {
+  width: 100%;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  padding: 0.7rem 0.85rem;
+  outline: none;
+  transition: border-color 120ms ease;
+}
+
+.field:focus {
+  border-color: color-mix(in oklab, var(--accent) 55%, var(--border));
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  padding: 0.55rem 1rem;
+  font-weight: 560;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: transform 120ms ease, background 120ms ease, border-color 120ms ease, opacity 120ms ease;
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn:not(:disabled):hover {
+  transform: translateY(-1px);
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+.btn-ghost {
+  background: transparent;
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.btn-ghost:not(:disabled):hover {
+  border-color: color-mix(in oklab, var(--accent) 40%, var(--border-strong));
+}
+
+.btn-danger {
+  background: transparent;
+  border-color: color-mix(in oklab, var(--danger) 50%, var(--border));
+  color: var(--danger);
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.fade-in {
+  animation: fadeIn 420ms ease both;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.feed-item {
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.feed-item[data-active="true"] {
+  background: #121412;
+  border-color: color-mix(in oklab, var(--accent) 35%, var(--border));
+}
+
+.char-warn {
+  color: #ffb454;
+}
+
+.char-over {
+  color: var(--danger);
+}
