@@ -46,11 +46,16 @@ Fill **Settings** (admin):
 
 1. Developer Console → User authentication → **OAuth 2.0**
 2. Type: **Web App**
-3. Callback: `http://127.0.0.1:3000/api/auth/x/callback` (not `localhost`)
-4. Website: `http://127.0.0.1:3000`
-5. Open the app at **http://127.0.0.1:3000** (same host as the callback)
-6. Paste Client ID + Client Secret in Settings → Save → **Connect with X**
-7. Needed scopes: `tweet.read`, `tweet.write`, `users.read`, `offline.access`, `media.write`
+3. App permissions: **Read and write** (needed for posting / media)
+4. Callback URI(s) — add **exact** matches for every host you use:
+   - Local: `http://127.0.0.1:3000/api/auth/x/callback`
+   - Vercel: `https://YOUR-APP.vercel.app/api/auth/x/callback`
+5. Website URL: same origin (e.g. `https://YOUR-APP.vercel.app`)
+6. In SocialPost Settings: paste **Client ID** + **Client Secret** → Save
+7. Open the app on that same host → **Connect with X**
+8. Needed scopes: `tweet.read`, `tweet.write`, `users.read`, `offline.access`, `media.write`
+
+If X shows “You weren’t able to give access to the App”, the callback URL in the X console does not exactly match the URL SocialPost is using (scheme + host + path).
 
 ## Daily jobs
 

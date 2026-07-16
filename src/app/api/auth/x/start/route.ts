@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { requireAdmin } from "@/lib/auth";
 import { createOAuth2Link, defaultRedirectUri, formatXError } from "@/lib/x";
 
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
 export async function GET(req: NextRequest) {
   const session = await requireAdmin();
   if (!session) {
@@ -9,28 +12,17 @@ export async function GET(req: NextRequest) {
   }
 
   try {
+    // Always bind OAuth to the host the admin is currently on (Vercel or local).
     const redirectUri = await defaultRedirectUri(req.nextUrl.origin);
-    const callbackOrigin = new URL(redirectUri).origin;
-    const currentOrigin = req.nextUrl.origin;
-
-    if (callbackOrigin !== currentOrigin) {
-      return NextResponse.redirect(
-        new URL(
-          `/?tab=settings&xerror=${encodeURIComponent(
-            `Open the app at ${callbackOrigin} (not ${currentOrigin}), then click Connect with X. Callback host must match.`,
-          )}`,
-          req.url,
-        ),
-      );
-    }
-
     const { url, codeVerifier, state } = await createOAuth2Link(redirectUri);
 
     const res = NextResponse.redirect(url);
+    const secure =
+      req.nextUrl.protocol === "https:" || process.env.NODE_ENV === "production";
     const cookieOpts = {
       httpOnly: true,
       sameSite: "lax" as const,
-      secure: false,
+      secure,
       path: "/",
       maxAge: 60 * 10,
     };
