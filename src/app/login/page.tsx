@@ -3,6 +3,24 @@
 import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
+async function readJson(res: Response): Promise<Record<string, unknown>> {
+  const text = await res.text();
+  if (!text) {
+    throw new Error(
+      res.ok
+        ? "Empty response from server"
+        : `Server error (${res.status}). Check MONGODB_URI / Atlas network access.`,
+    );
+  }
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    throw new Error(
+      `Server returned non-JSON (${res.status}). Check Vercel function logs.`,
+    );
+  }
+}
+
 export default function LoginPage() {
   const router = useRouter();
   const [mode, setMode] = useState<"loading" | "setup" | "login">("loading");
@@ -13,12 +31,15 @@ export default function LoginPage() {
 
   useEffect(() => {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
+    const timeout = setTimeout(() => controller.abort(), 15000);
 
     fetch("/api/auth/me", { signal: controller.signal, cache: "no-store" })
       .then(async (r) => {
-        if (!r.ok) throw new Error("Auth check failed");
-        return r.json();
+        const data = await readJson(r);
+        if (!r.ok) {
+          throw new Error(String(data.error || "Auth check failed"));
+        }
+        return data;
       })
       .then((data) => {
         if (data.authenticated) {
@@ -27,7 +48,12 @@ export default function LoginPage() {
         }
         setMode(data.needsSetup ? "setup" : "login");
       })
-      .catch(() => setMode("login"))
+      .catch((err) => {
+        setMode("login");
+        if (err instanceof Error && err.name !== "AbortError") {
+          setError(err.message);
+        }
+      })
       .finally(() => clearTimeout(timeout));
 
     return () => {
@@ -46,8 +72,8 @@ export default function LoginPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Failed");
+      const data = await readJson(res);
+      if (!res.ok) throw new Error(String(data.error || "Failed"));
       window.location.replace("/");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
