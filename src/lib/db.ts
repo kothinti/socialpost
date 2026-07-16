@@ -194,8 +194,8 @@ function formatMongoError(err: unknown): string {
   if (/server selection timed out|timed out|Timeout/i.test(msg)) {
     return "MongoDB connection timed out. Allow Vercel IPs in Atlas Network Access (0.0.0.0/0), then redeploy.";
   }
-  if (/SSL|TLS|certificate/i.test(msg)) {
-    return `MongoDB TLS error: ${msg}`;
+  if (/SSL|TLS|certificate|alert number 80|TLSV1_ALERT/i.test(msg)) {
+    return "MongoDB blocked the TLS handshake (usually Atlas Network Access). In Atlas → Network Access, add 0.0.0.0/0 (Allow from anywhere), wait ~1 minute, then retry. Vercel IPs are dynamic so a single IP whitelist will keep failing.";
   }
   return `MongoDB error: ${msg}`;
 }
