@@ -54,8 +54,7 @@ export function formatXError(err: unknown): string {
 }
 
 export async function defaultRedirectUri(reqOrigin?: string) {
-  const s = await getSettings();
-  if (s.x_redirect_uri?.trim()) return s.x_redirect_uri.trim();
+  // Prefer the live request origin so local + Vercel both work without stale settings.
   if (reqOrigin) {
     try {
       const u = new URL(reqOrigin);
@@ -65,6 +64,20 @@ export async function defaultRedirectUri(reqOrigin?: string) {
       /* fall through */
     }
   }
+
+  const s = await getSettings();
+  if (s.x_redirect_uri?.trim()) return s.x_redirect_uri.trim();
+
+  const appUrl = process.env.APP_URL?.trim() || process.env.VERCEL_URL?.trim();
+  if (appUrl) {
+    const base = appUrl.startsWith("http") ? appUrl : `https://${appUrl}`;
+    try {
+      return `${new URL(base).origin}/api/auth/x/callback`;
+    } catch {
+      /* fall through */
+    }
+  }
+
   return "http://127.0.0.1:3000/api/auth/x/callback";
 }
 
