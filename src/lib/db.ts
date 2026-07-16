@@ -172,34 +172,70 @@ const globalForMongo = globalThis as unknown as {
 };
 
 function requireUri() {
-  const uri = process.env.MONGODB_URI?.trim();
-  if (!uri) {
+  const raw = process.env.MONGODB_URI?.trim();
+  if (!raw) {
     throw new Error(
-      "MONGODB_URI is not set. Add it to .env.local (see .env.example).",
+      "MONGODB_URI is not set. Add it in Vercel Project Settings → Environment Variables.",
     );
   }
-  return uri;
+  // Vercel UI sometimes stores values wrapped in quotes
+  return raw.replace(/^['"]|['"]$/g, "");
+}
+
+function formatMongoError(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/MONGODB_URI is not set/i.test(msg)) return msg;
+  if (/ENOTFOUND|querySrv|getaddrinfo/i.test(msg)) {
+    return "Cannot reach MongoDB host (DNS). Check MONGODB_URI and Atlas Network Access.";
+  }
+  if (/authentication failed|bad auth|SCRAM/i.test(msg)) {
+    return "MongoDB authentication failed. Check username/password in MONGODB_URI.";
+  }
+  if (/server selection timed out|timed out|Timeout/i.test(msg)) {
+    return "MongoDB connection timed out. Allow Vercel IPs in Atlas Network Access (0.0.0.0/0), then redeploy.";
+  }
+  if (/SSL|TLS|certificate/i.test(msg)) {
+    return `MongoDB TLS error: ${msg}`;
+  }
+  return `MongoDB error: ${msg}`;
 }
 
 export async function getMongo(): Promise<Db> {
   if (globalForMongo.__mongoDb) return globalForMongo.__mongoDb;
 
-  const client =
-    globalForMongo.__mongoClient ?? new MongoClient(requireUri());
-  if (!globalForMongo.__mongoClient) {
-    globalForMongo.__mongoClient = client;
-    await client.connect();
+  try {
+    const uri = requireUri();
+    const client =
+      globalForMongo.__mongoClient ??
+      new MongoClient(uri, {
+        serverSelectionTimeoutMS: 8000,
+        connectTimeoutMS: 8000,
+      });
+
+    if (!globalForMongo.__mongoClient) {
+      globalForMongo.__mongoClient = client;
+      await client.connect();
+    }
+
+    const dbName = process.env.MONGODB_DB?.trim() || undefined;
+    const db = client.db(dbName);
+    globalForMongo.__mongoDb = db;
+
+    if (!globalForMongo.__mongoIndexes) {
+      globalForMongo.__mongoIndexes = ensureIndexes(db).catch((err) => {
+        globalForMongo.__mongoIndexes = undefined;
+        throw err;
+      });
+    }
+    await globalForMongo.__mongoIndexes;
+
+    return db;
+  } catch (err) {
+    globalForMongo.__mongoClient = undefined;
+    globalForMongo.__mongoDb = undefined;
+    globalForMongo.__mongoIndexes = undefined;
+    throw new Error(formatMongoError(err));
   }
-
-  const db = client.db();
-  globalForMongo.__mongoDb = db;
-
-  if (!globalForMongo.__mongoIndexes) {
-    globalForMongo.__mongoIndexes = ensureIndexes(db);
-  }
-  await globalForMongo.__mongoIndexes;
-
-  return db;
 }
 
 async function ensureIndexes(db: Db) {
