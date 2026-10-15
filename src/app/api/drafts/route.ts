@@ -10,8 +10,8 @@ import {
   type Draft,
 } from "@/lib/db";
 import { jsonError, jsonOk, unauthorized } from "@/lib/http";
+import { canReplyViaApi, publishDraft, REPLY_NOT_ALLOWED } from "@/lib/jobs";
 import { toIsoUtc } from "@/lib/time";
-import { publishPost } from "@/lib/x";
 import { z } from "zod";
 
 function serialize(d: Draft) {
@@ -25,11 +25,11 @@ export async function GET() {
 }
 
 const createSchema = z.object({
-  type: z.enum(["reply", "original"]),
+  type: z.enum(["reply", "quote", "original"]),
   content: z.string().default(""),
+  /** Post replied to or quoted. */
   reply_to_x_id: z.string().optional(),
   reply_to_handle: z.string().optional(),
-  reply_to_content: z.string().optional(),
   media_paths: z.array(z.string()).optional(),
   status: z.enum(["draft", "scheduled"]).optional(),
   scheduled_at: z.string().nullable().optional(),
@@ -42,8 +42,11 @@ export async function POST(req: NextRequest) {
   const body = createSchema.safeParse(await req.json());
   if (!body.success) return jsonError("Invalid draft");
 
-  if (body.data.type === "reply" && !body.data.reply_to_x_id) {
-    return jsonError("reply_to_x_id required for replies");
+  if (body.data.type !== "original" && !body.data.reply_to_x_id) {
+    return jsonError("reply_to_x_id required for replies and quotes");
+  }
+  if (body.data.type === "reply" && !(await canReplyViaApi(body.data.reply_to_x_id))) {
+    return jsonError(REPLY_NOT_ALLOWED);
   }
 
   const status = body.data.status ?? "draft";
@@ -60,7 +63,7 @@ export async function POST(req: NextRequest) {
     content: body.data.content,
     reply_to_x_id: body.data.reply_to_x_id ?? null,
     reply_to_handle: body.data.reply_to_handle ?? null,
-    reply_to_content: body.data.reply_to_content ?? null,
+    reply_to_content: null,
     media_paths: body.data.media_paths ?? [],
     status,
     scheduled_at: scheduledAt,
@@ -138,28 +141,10 @@ export async function PATCH(req: NextRequest) {
   ]);
   if (!claimed) return jsonError("Draft is already being posted", 409);
 
-  try {
-    const content = body.data.content ?? draft.content;
-    const xPostId = await publishPost({
-      text: content,
-      replyToId: draft.type === "reply" ? draft.reply_to_x_id : null,
-      mediaPaths: body.data.media_paths ?? draft.media_paths,
-    });
-
-    const updated = await updateDraft(draft.id, {
-      content,
-      media_paths: body.data.media_paths ?? draft.media_paths,
-      status: "posted",
-      posted_at: new Date().toISOString(),
-      x_post_id: xPostId,
-      error: null,
-      scheduled_at: null,
-    });
-
-    return jsonOk({ draft: serialize(updated!) });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    await updateDraft(draft.id, { status: "failed", error: message });
-    return jsonError(message, 500);
-  }
+  const result = await publishDraft(claimed, {
+    content: body.data.content,
+    media_paths: body.data.media_paths,
+  });
+  if (!result.ok) return jsonError(result.error, 500);
+  return jsonOk({ draft: serialize(result.draft) });
 }

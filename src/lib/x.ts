@@ -4,6 +4,7 @@ import path from "path";
 import {
   deleteFetchedPostById,
   deleteOldFetchedPosts,
+  deleteOldMentions,
   getSettings,
   getUploadsDir,
   listFetchedPostsSince,
@@ -11,6 +12,7 @@ import {
   saveOAuthTokens,
   updateSettings,
   upsertFetchedPost,
+  upsertMention,
   type FetchedPost,
   type Settings,
 } from "./db";
@@ -161,9 +163,11 @@ export async function completeOAuth2Login(opts: {
   });
 
   let handle: string | undefined;
+  let userId: string | undefined;
   try {
     const me = await result.client.v2.me({ "user.fields": ["username"] });
     handle = me.data?.username;
+    userId = me.data?.id;
   } catch {
     /* optional */
   }
@@ -173,6 +177,7 @@ export async function completeOAuth2Login(opts: {
     refreshToken: result.refreshToken,
     expiresIn: result.expiresIn,
     handle: handle ?? null,
+    userId: userId ?? null,
   });
 
   return { handle, accessToken: result.accessToken };
@@ -189,9 +194,12 @@ export async function verifyXWriteAuth(): Promise<{
     if (!me.data?.id) {
       return { ok: false, message: "X returned no user for these credentials" };
     }
-    if (me.data.username) {
-      await updateSettings({ x_connected_handle: me.data.username });
-    }
+    const s = await getSettings();
+    await updateSettings({
+      x_connected_handle: me.data.username || s.x_connected_handle,
+      x_connected_user_id: me.data.id,
+      ...(s.x_connected_user_id !== me.data.id ? { mentions_since_id: "" } : {}),
+    });
     return {
       ok: true,
       user: {
@@ -394,7 +402,8 @@ export async function fetchWatchedPostsLast24h(): Promise<{
     throw new Error(formatXError(err));
   }
 
-  await deleteOldFetchedPosts(48);
+  // Keep stored X content short-lived (Developer Policy: stored content must stay current).
+  await deleteOldFetchedPosts(24);
 
   const stale = await listFetchedPostsSince(24, 500);
   for (const row of stale) {
@@ -411,6 +420,67 @@ export async function fetchWatchedPostsLast24h(): Promise<{
     topic_search: Boolean(searchQuery),
     search_query: searchQuery,
   };
+}
+
+async function getConnectedUserId(): Promise<string> {
+  const s = await getSettings();
+  if (s.x_connected_user_id) return s.x_connected_user_id;
+  const client = await getWriteClient();
+  const me = await client.v2.me();
+  if (!me.data?.id) throw new Error("X returned no user for the connected account");
+  await updateSettings({ x_connected_user_id: me.data.id });
+  return me.data.id;
+}
+
+/**
+ * Pull new posts that @mention the connected account. These are the only posts
+ * X lets this app reply to via the API. Uses the account's own user token so X
+ * bills them as owned reads ($0.001 each), and `since_id` so each run only pays
+ * for mentions it hasn't seen.
+ */
+export async function fetchMentions(): Promise<{ fetched: number; skipped?: string }> {
+  const settings = await getSettings();
+  if (!settings.enable_mentions) return { fetched: 0, skipped: "disabled" };
+  if (!settings.x_access_token) return { fetched: 0, skipped: "not connected" };
+
+  try {
+    const userId = await getConnectedUserId();
+    const client = await getWriteClient();
+    const maxResults = Math.min(100, Math.max(5, settings.mentions_max_results));
+
+    const page = await client.v2.userMentionTimeline(userId, {
+      max_results: maxResults,
+      ...(settings.mentions_since_id ? { since_id: settings.mentions_since_id } : {}),
+      "tweet.fields": ["created_at", "author_id"],
+      expansions: ["author_id"],
+      "user.fields": ["username", "name"],
+    });
+
+    const usersById = new Map<string, { username: string; name?: string }>();
+    for (const u of page.includes?.users ?? []) {
+      usersById.set(u.id, { username: u.username, name: u.name });
+    }
+
+    for (const tweet of page.tweets) {
+      const author = tweet.author_id ? usersById.get(tweet.author_id) : undefined;
+      await upsertMention({
+        x_post_id: tweet.id,
+        author_handle: author?.username ?? "unknown",
+        author_name: author?.name ?? null,
+        content: tweet.text,
+        posted_at: tweet.created_at ?? null,
+      });
+    }
+
+    if (page.meta?.newest_id) {
+      await updateSettings({ mentions_since_id: page.meta.newest_id });
+    }
+    await deleteOldMentions(7);
+
+    return { fetched: page.tweets.length };
+  } catch (err) {
+    throw new Error(formatXError(err));
+  }
 }
 
 /**
@@ -451,6 +521,7 @@ export async function uploadMediaFiles(mediaPaths: string[]): Promise<string[]> 
 export async function publishPost(opts: {
   text: string;
   replyToId?: string | null;
+  quoteTweetId?: string | null;
   mediaPaths?: string[];
 }): Promise<string> {
   try {
@@ -471,11 +542,15 @@ export async function publishPost(opts: {
     const payload: {
       text: string;
       reply?: { in_reply_to_tweet_id: string };
+      quote_tweet_id?: string;
       media?: { media_ids: MediaTuple };
     } = { text: opts.text };
 
     if (opts.replyToId) {
       payload.reply = { in_reply_to_tweet_id: opts.replyToId };
+    }
+    if (opts.quoteTweetId) {
+      payload.quote_tweet_id = opts.quoteTweetId;
     }
     if (mediaIds.length > 0) {
       payload.media = { media_ids: mediaIds as MediaTuple };
@@ -485,6 +560,11 @@ export async function publishPost(opts: {
     if (!result.data?.id) throw new Error("X API returned no post id");
     return result.data.id;
   } catch (err) {
+    if (opts.replyToId && err instanceof ApiResponseError && err.code === 403) {
+      throw new Error(
+        "X refused this reply. The API only allows replies to posts that @mention your account or quote your post. Use Open in X to reply manually.",
+      );
+    }
     throw new Error(formatXError(err));
   }
 }

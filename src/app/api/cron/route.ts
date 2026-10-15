@@ -1,7 +1,12 @@
 import { NextRequest } from "next/server";
 import { getSession } from "@/lib/auth";
 import { jsonError, jsonOk, unauthorized } from "@/lib/http";
-import { processDueSchedules, runCronBundle, runDailyFetch } from "@/lib/jobs";
+import {
+  processDueSchedules,
+  runCronBundle,
+  runDailyFetch,
+  runMentionsFetch,
+} from "@/lib/jobs";
 
 function authorized(req: NextRequest) {
   const secret = process.env.CRON_SECRET;
@@ -32,6 +37,7 @@ async function runJob(req: NextRequest) {
   try {
     if (job === "fetch") return jsonOk(await runDailyFetch());
     if (job === "schedules") return jsonOk(await processDueSchedules());
+    if (job === "mentions") return jsonOk(await runMentionsFetch());
     return jsonOk(await runCronBundle());
   } catch (err) {
     return jsonError(err instanceof Error ? err.message : "Cron failed", 500);

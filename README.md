@@ -1,4 +1,4 @@
-# SocialPost
+# MonfortSocial
 
 Personal workspace for watching X handles / topics, drafting AI replies/posts, and posting or scheduling to a shared X account.
 
@@ -51,11 +51,11 @@ Fill **Settings** (admin):
    - Local: `http://127.0.0.1:3000/api/auth/x/callback`
    - Vercel: `https://YOUR-APP.vercel.app/api/auth/x/callback`
 5. Website URL: same origin (e.g. `https://YOUR-APP.vercel.app`)
-6. In SocialPost Settings: paste **Client ID** + **Client Secret** → Save
+6. In MonfortSocial Settings: paste **Client ID** + **Client Secret** → Save
 7. Open the app on that same host → **Connect with X**
 8. Needed scopes: `tweet.read`, `tweet.write`, `users.read`, `offline.access`, `media.write`
 
-If X shows “You weren’t able to give access to the App”, the callback URL in the X console does not exactly match the URL SocialPost is using (scheme + host + path).
+If X shows “You weren’t able to give access to the App”, the callback URL in the X console does not exactly match the URL MonfortSocial is using (scheme + host + path).
 
 ## Daily jobs
 
@@ -84,6 +84,14 @@ Or while signed in, call `POST /api/cron` / use **Refresh now** on the Feed tab.
 | `npm run dev` | Dev server |
 | `npm run build` / `npm start` | Production |
 | `npm run cron` | Trigger fetch + schedule flush |
+
+## X API rules this app follows
+
+- **Replies:** since Feb 2026, X only accepts API replies to posts that @mention your account (or quote your post). The Mentions tab replies through the API, and the server checks that the post is a stored mention. Replies to any other post open X's own reply box (web intent) so you post them yourself.
+- **Quotes and original posts** go through the API as before, with scheduling and media.
+- **AI:** only your notes are sent to OpenAI, never the X post text (the X Developer Agreement restricts sharing X content with third parties). A person reviews every draft; nothing replies automatically.
+- **Storage:** fetched feed posts are kept for 24 hours and mentions for 7 days.
+- **Cost:** pay-per-use posts cost $0.015, or $0.20 with a link (the composer warns you). Mentions are fetched with your own token, billed as owned reads ($0.001 each), and only new ones are fetched.
 
 ## Notes
 

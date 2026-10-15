@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
@@ -92,13 +93,18 @@ export default function LoginPage() {
   return (
     <main className="min-h-screen grid place-items-center px-4">
       <div className="panel w-full max-w-md p-8 fade-in">
-        <p
-          className="text-3xl tracking-tight mb-1"
-          style={{ fontFamily: "var(--font-syne), sans-serif" }}
-        >
-          SocialPost
-        </p>
-        <p className="muted mb-8 text-sm">
+        <h1 className="flex items-center gap-2.5 mb-3">
+          <Image
+            src="/monfort-logo.svg"
+            alt="Monfort"
+            width={741}
+            height={166}
+            priority
+            className="h-9 w-auto"
+          />
+          <span className="text-xl">Social</span>
+        </h1>
+        <p className="tagline mb-8">
           {mode === "setup"
             ? "Create the admin account to get started. Later users are added by an admin."
             : "Sign in to continue."}

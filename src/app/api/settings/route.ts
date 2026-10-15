@@ -20,6 +20,8 @@ async function publicSettings(reqOrigin?: string) {
     min_reply_count: s.min_reply_count,
     min_repost_count: s.min_repost_count,
     enable_topic_search: s.enable_topic_search,
+    enable_mentions: s.enable_mentions,
+    mentions_max_results: s.mentions_max_results,
     has_x_client_id: Boolean(s.x_api_key),
     has_x_client_secret: Boolean(s.x_api_secret),
     has_x_bearer_token: Boolean(s.x_bearer_token),
@@ -45,6 +47,8 @@ async function postingView() {
     min_reply_count: s.min_reply_count,
     min_repost_count: s.min_repost_count,
     enable_topic_search: s.enable_topic_search,
+    enable_mentions: s.enable_mentions,
+    mentions_max_results: s.mentions_max_results,
     has_x_client_id: Boolean(s.x_api_key),
     has_x_client_secret: Boolean(s.x_api_secret),
     has_x_bearer_token: Boolean(s.x_bearer_token),
@@ -82,6 +86,8 @@ const schema = z.object({
   min_reply_count: z.number().int().min(0).optional(),
   min_repost_count: z.number().int().min(0).optional(),
   enable_topic_search: z.boolean().optional(),
+  enable_mentions: z.boolean().optional(),
+  mentions_max_results: z.number().int().min(5).max(100).optional(),
 });
 
 export async function PUT(req: NextRequest) {
@@ -127,6 +133,9 @@ export async function PUT(req: NextRequest) {
     ),
     enable_topic_search:
       data.enable_topic_search ?? current.enable_topic_search,
+    enable_mentions: data.enable_mentions ?? current.enable_mentions,
+    mentions_max_results:
+      data.mentions_max_results ?? current.mentions_max_results,
   });
 
   return jsonOk(await publicSettings(req.nextUrl.origin));
