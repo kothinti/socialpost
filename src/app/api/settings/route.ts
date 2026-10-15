@@ -5,6 +5,7 @@ import { clampNonNegInt, normalizeKeywords } from "@/lib/feed-filters";
 import { forbidden, jsonError, jsonOk, unauthorized } from "@/lib/http";
 import { defaultRedirectUri } from "@/lib/x";
 import { z } from "zod";
+import { publicOrigin } from "@/lib/origin";
 
 async function publicSettings(reqOrigin?: string) {
   const s = await getSettings();
@@ -62,7 +63,7 @@ async function postingView() {
 
 export async function GET(req: NextRequest) {
   const admin = await requireAdmin();
-  if (admin) return jsonOk(await publicSettings(req.nextUrl.origin));
+  if (admin) return jsonOk(await publicSettings(publicOrigin(req)));
 
   const session = await getSession();
   if (!session) return unauthorized();
@@ -138,5 +139,5 @@ export async function PUT(req: NextRequest) {
       data.mentions_max_results ?? current.mentions_max_results,
   });
 
-  return jsonOk(await publicSettings(req.nextUrl.origin));
+  return jsonOk(await publicSettings(publicOrigin(req)));
 }

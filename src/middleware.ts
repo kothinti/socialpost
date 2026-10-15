@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { jwtVerify } from "jose";
 import { getAuthSecret } from "@/lib/auth-secret";
+import { publicUrl } from "@/lib/origin";
 
 export async function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
@@ -43,13 +44,13 @@ export async function middleware(req: NextRequest) {
 
   if (pathname === "/login") {
     if (authed) {
-      return NextResponse.redirect(new URL("/", req.url));
+      return NextResponse.redirect(publicUrl(req, "/"));
     }
     return NextResponse.next();
   }
 
   if (!authed) {
-    return NextResponse.redirect(new URL("/login", req.url));
+    return NextResponse.redirect(publicUrl(req, "/login"));
   }
 
   return NextResponse.next();

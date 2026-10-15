@@ -100,6 +100,14 @@ Or while signed in, call `POST /api/cron` / use **Refresh now** on the Feed tab.
 - Media uploads are stored in MongoDB (GridFS bucket `media`, max 15MB) so they work on Vercel and survive restarts. Drafts created before this still read from `data/uploads/`. Note Vercel caps request bodies at 4.5MB, so larger files only upload on a VPS deploy.
 - Switching from SQLite: start fresh with MongoDB (no automatic migration).
 
+## Railway
+
+1. New project → Deploy from GitHub repo. Railway detects Next.js and runs `npm run build` / `npm start` (the app listens on Railway's `PORT`).
+2. Variables: `MONGODB_URI`, `AUTH_SECRET`, `CRON_SECRET` (long random strings for the secrets).
+3. Settings → Networking → Generate Domain. In the X developer console set the callback to `https://<your-domain>/api/auth/x/callback`.
+4. Cron: add a second service from the same repo with Start Command `npm run cron`, Cron Schedule `*/5 * * * *`, and variables `APP_URL=https://<your-domain>` and the same `CRON_SECRET`. It calls `/api/cron` (fetch, mentions, due schedules) and exits.
+5. Redirects and the OAuth callback use the proxy's `X-Forwarded-Host` / `X-Forwarded-Proto`, so no extra URL config is needed.
+
 ## Vercel
 
 1. **Framework Preset** must be **Next.js** (Settings → Build and Deployment). Leave **Output Directory** empty (do not set `.next`).

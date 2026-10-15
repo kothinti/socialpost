@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAdmin } from "@/lib/auth";
 import { createOAuth2Link, defaultRedirectUri, formatXError } from "@/lib/x";
+import { publicOrigin, publicUrl } from "@/lib/origin";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -8,17 +9,17 @@ export const dynamic = "force-dynamic";
 export async function GET(req: NextRequest) {
   const session = await requireAdmin();
   if (!session) {
-    return NextResponse.redirect(new URL("/login", req.url));
+    return NextResponse.redirect(publicUrl(req, "/login"));
   }
 
   try {
     // Always bind OAuth to the host the admin is currently on (Vercel or local).
-    const redirectUri = await defaultRedirectUri(req.nextUrl.origin);
+    const redirectUri = await defaultRedirectUri(publicOrigin(req));
     const { url, codeVerifier, state } = await createOAuth2Link(redirectUri);
 
     const res = NextResponse.redirect(url);
     const secure =
-      req.nextUrl.protocol === "https:" || process.env.NODE_ENV === "production";
+      publicOrigin(req).startsWith("https:") || process.env.NODE_ENV === "production";
     const cookieOpts = {
       httpOnly: true,
       sameSite: "lax" as const,
@@ -32,6 +33,6 @@ export async function GET(req: NextRequest) {
     return res;
   } catch (err) {
     const message = encodeURIComponent(formatXError(err));
-    return NextResponse.redirect(new URL(`/?tab=settings&xerror=${message}`, req.url));
+    return NextResponse.redirect(publicUrl(req, `/?tab=settings&xerror=${message}`));
   }
 }
