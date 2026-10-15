@@ -25,7 +25,7 @@ type Draft = {
   reply_to_content: string | null;
   content: string;
   media_paths: string[];
-  status: "draft" | "scheduled" | "posted" | "failed";
+  status: "draft" | "scheduled" | "posting" | "posted" | "failed";
   scheduled_at: string | null;
   posted_at: string | null;
   x_post_id: string | null;
@@ -213,7 +213,7 @@ export default function HomePage() {
     charCount > 280 ? "char-over" : charCount > 240 ? "char-warn" : "muted";
 
   const queue = useMemo(
-    () => drafts.filter((d) => d.status === "scheduled" || d.status === "failed" || d.status === "draft"),
+    () => drafts.filter((d) => d.status !== "posted"),
     [drafts],
   );
 
@@ -740,7 +740,7 @@ export default function HomePage() {
                       </p>
                     ) : null}
                     <div className="flex gap-2">
-                      {d.status !== "posted" ? (
+                      {d.status !== "posted" && d.status !== "posting" ? (
                         <button
                           className="btn btn-primary"
                           type="button"

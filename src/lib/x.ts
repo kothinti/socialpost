@@ -7,6 +7,7 @@ import {
   getSettings,
   getUploadsDir,
   listFetchedPostsSince,
+  readMedia,
   saveOAuthTokens,
   updateSettings,
   upsertFetchedPost,
@@ -412,17 +413,31 @@ export async function fetchWatchedPostsLast24h(): Promise<{
   };
 }
 
-export async function uploadMediaFiles(absolutePaths: string[]): Promise<string[]> {
-  if (absolutePaths.length === 0) return [];
+/**
+ * Media paths come from the client, so only ever use the basename. New uploads
+ * live in GridFS; older drafts may reference files in the local uploads dir
+ * (stored as a bare name, data/uploads/..., or an absolute path).
+ */
+async function loadMedia(p: string): Promise<Buffer> {
+  const base = path.basename(p);
+  if (!base || base === "." || base === "..") {
+    throw new Error(`Invalid media path: ${p}`);
+  }
+  const stored = await readMedia(base);
+  if (stored) return stored;
+  const legacy = path.join(getUploadsDir(), base);
+  if (fs.existsSync(legacy)) return fs.readFileSync(legacy);
+  throw new Error(`Media file missing: ${base}`);
+}
+
+export async function uploadMediaFiles(mediaPaths: string[]): Promise<string[]> {
+  if (mediaPaths.length === 0) return [];
   const client = await getWriteClient();
   const mediaIds: string[] = [];
 
-  for (const filePath of absolutePaths) {
-    if (!fs.existsSync(filePath)) {
-      throw new Error(`Media file missing: ${filePath}`);
-    }
-    const buffer = fs.readFileSync(filePath);
-    const { media_type, media_category } = mimeForFile(filePath);
+  for (const p of mediaPaths) {
+    const buffer = await loadMedia(p);
+    const { media_type, media_category } = mimeForFile(p);
     const mediaId = await client.v2.uploadMedia(buffer, {
       media_type,
       media_category,
@@ -433,28 +448,19 @@ export async function uploadMediaFiles(absolutePaths: string[]): Promise<string[
   return mediaIds;
 }
 
-function resolveMediaPath(p: string) {
-  if (path.isAbsolute(p)) return p;
-  // New uploads store bare filenames; older drafts may store data/uploads/...
-  const base = path.basename(p);
-  const inUploads = path.join(getUploadsDir(), base);
-  if (fs.existsSync(inUploads)) return inUploads;
-  return path.join(/*turbopackIgnore: true*/ process.cwd(), p);
-}
-
 export async function publishPost(opts: {
   text: string;
   replyToId?: string | null;
   mediaPaths?: string[];
 }): Promise<string> {
   try {
-    const client = await getWriteClient();
-    const absolute = (opts.mediaPaths ?? []).map(resolveMediaPath);
-    const mediaIds = await uploadMediaFiles(absolute);
-
-    if (mediaIds.length > 4) {
+    const mediaPaths = opts.mediaPaths ?? [];
+    if (mediaPaths.length > 4) {
       throw new Error("X allows at most 4 media attachments");
     }
+
+    const client = await getWriteClient();
+    const mediaIds = await uploadMediaFiles(mediaPaths);
 
     type MediaTuple =
       | [string]

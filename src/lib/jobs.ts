@@ -1,4 +1,5 @@
 import {
+  claimDraftForPosting,
   listDueDrafts,
   logJob,
   updateDraft,
@@ -22,11 +23,17 @@ export async function runDailyFetch() {
 }
 
 export async function processDueSchedules() {
-  const due = await listDueDrafts();
+  const dueDrafts = await listDueDrafts();
   const results: { id: string; ok: boolean; error?: string; xPostId?: string }[] =
     [];
 
-  for (const draft of due) {
+  for (const due of dueDrafts) {
+    const draft = await claimDraftForPosting(due.id, ["scheduled"], {
+      dueBy: new Date(),
+    });
+    // Another cron run or a manual "Post now" got there first.
+    if (!draft) continue;
+
     try {
       const mediaPaths = draft.media_paths ?? [];
       const xPostId = await publishPost({

@@ -1,9 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { jwtVerify } from "jose";
-
-const SECRET = new TextEncoder().encode(
-  process.env.AUTH_SECRET || "socialpost-dev-secret-change-me",
-);
+import { getAuthSecret } from "@/lib/auth-secret";
 
 export async function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
@@ -30,7 +27,7 @@ export async function middleware(req: NextRequest) {
   let authed = false;
   if (token) {
     try {
-      await jwtVerify(token, SECRET);
+      await jwtVerify(token, getAuthSecret());
       authed = true;
     } catch {
       authed = false;

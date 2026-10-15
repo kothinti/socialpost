@@ -89,7 +89,7 @@ Or while signed in, call `POST /api/cron` / use **Refresh now** on the Feed tab.
 
 - Shared workspace: one X connection, one feed, one draft queue.
 - Secrets live in MongoDB settings; keep your DB private.
-- Media uploads live in `data/uploads/` locally (max 15MB). On Vercel they use `/tmp` (ephemeral).
+- Media uploads are stored in MongoDB (GridFS bucket `media`, max 15MB) so they work on Vercel and survive restarts. Drafts created before this still read from `data/uploads/`. Note Vercel caps request bodies at 4.5MB, so larger files only upload on a VPS deploy.
 - Switching from SQLite: start fresh with MongoDB (no automatic migration).
 
 ## Vercel
@@ -98,4 +98,5 @@ Or while signed in, call `POST /api/cron` / use **Refresh now** on the Feed tab.
 2. Set env vars: `MONGODB_URI`, `AUTH_SECRET`, `CRON_SECRET` (and optionally `APP_URL` to your `*.vercel.app` URL).
 3. Use a MongoDB Atlas URI that allows Vercel IPs (`0.0.0.0/0` is simplest for serverless).
 4. Redeploy after changing env or framework settings.
-5. Daily cron: use Vercel Cron or an external caller against `POST /api/cron` with `Authorization: Bearer $CRON_SECRET`. Local DigitalOcean/VPS deploy remains the better fit for persistent uploads + cron.
+5. Cron: Vercel Cron calls `GET /api/cron` and sends `Authorization: Bearer $CRON_SECRET` automatically when `CRON_SECRET` is set. External callers can use `GET` or `POST` with the same header. Scheduled posts only go out when cron runs, so run it as often as your plan allows.
+6. `AUTH_SECRET` is required in production; requests that need a session fail until it is set.

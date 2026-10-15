@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import { getSession } from "@/lib/auth";
 import {
+  claimDraftForPosting,
   createDraft,
   deleteDraft,
   findDraftById,
@@ -91,6 +92,10 @@ export async function PATCH(req: NextRequest) {
     return jsonOk({ ok: true });
   }
 
+  if (draft.status === "posting" || draft.status === "posted") {
+    return jsonError(`Draft is already ${draft.status}`, 409);
+  }
+
   if (body.data.action === "update" || body.data.action === "schedule") {
     const content = body.data.content ?? draft.content;
     const media = body.data.media_paths ?? draft.media_paths;
@@ -109,16 +114,29 @@ export async function PATCH(req: NextRequest) {
     const nextStatus =
       body.data.action === "schedule" || scheduledAt ? "scheduled" : "draft";
 
-    const updated = await updateDraft(draft.id, {
-      content,
-      media_paths: media,
-      status: nextStatus,
-      scheduled_at: scheduledAt,
-      error: null,
-    });
+    const updated = await updateDraft(
+      draft.id,
+      {
+        content,
+        media_paths: media,
+        status: nextStatus,
+        scheduled_at: scheduledAt,
+        error: null,
+      },
+      ["draft", "scheduled", "failed"],
+    );
+    if (!updated) return jsonError("Draft is already being posted", 409);
 
-    return jsonOk({ draft: serialize(updated!) });
+    return jsonOk({ draft: serialize(updated) });
   }
+
+  // Claim before publishing so a concurrent cron run (or double click) can't post it too.
+  const claimed = await claimDraftForPosting(draft.id, [
+    "draft",
+    "scheduled",
+    "failed",
+  ]);
+  if (!claimed) return jsonError("Draft is already being posted", 409);
 
   try {
     const content = body.data.content ?? draft.content;

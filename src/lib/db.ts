@@ -1,4 +1,10 @@
-import { MongoClient, ObjectId, type Collection, type Db } from "mongodb";
+import {
+  GridFSBucket,
+  MongoClient,
+  ObjectId,
+  type Collection,
+  type Db,
+} from "mongodb";
 import fs from "fs";
 import path from "path";
 
@@ -98,6 +104,8 @@ type FetchedPostDoc = {
   fetched_at: Date;
 };
 
+export type DraftStatus = "draft" | "scheduled" | "posting" | "posted" | "failed";
+
 export type Draft = {
   id: string;
   type: "reply" | "original";
@@ -106,7 +114,7 @@ export type Draft = {
   reply_to_content: string | null;
   content: string;
   media_paths: string[];
-  status: "draft" | "scheduled" | "posted" | "failed";
+  status: DraftStatus;
   scheduled_at: string | null;
   posted_at: string | null;
   x_post_id: string | null;
@@ -124,7 +132,7 @@ type DraftDoc = {
   reply_to_content: string | null;
   content: string;
   media_paths: string[];
-  status: "draft" | "scheduled" | "posted" | "failed";
+  status: DraftStatus;
   scheduled_at: Date | null;
   posted_at: Date | null;
   x_post_id: string | null;
@@ -552,6 +560,7 @@ export async function listDrafts(): Promise<Draft[]> {
   const db = await getMongo();
   const docs = await draftsCol(db).find({}).toArray();
   const statusOrder: Record<string, number> = {
+    posting: 0,
     scheduled: 0,
     draft: 1,
     failed: 2,
@@ -623,6 +632,8 @@ export async function updateDraft(
     x_post_id: string | null;
     error: string | null;
   }>,
+  /** Only apply the patch if the draft is still in one of these statuses. */
+  onlyIfStatus?: DraftStatus[],
 ): Promise<Draft | null> {
   if (!ObjectId.isValid(id)) return null;
   const db = await getMongo();
@@ -637,8 +648,11 @@ export async function updateDraft(
   if (patch.x_post_id !== undefined) $set.x_post_id = patch.x_post_id;
   if (patch.error !== undefined) $set.error = patch.error;
 
+  const filter: Record<string, unknown> = { _id: new ObjectId(id) };
+  if (onlyIfStatus) filter.status = { $in: onlyIfStatus };
+
   const result = await draftsCol(db).findOneAndUpdate(
-    { _id: new ObjectId(id) },
+    filter,
     { $set },
     { returnDocument: "after" },
   );
@@ -652,6 +666,31 @@ export async function deleteDraft(id: string): Promise<boolean> {
   return result.deletedCount > 0;
 }
 
+/**
+ * Atomically move a draft into "posting" so only one caller (cron or a manual
+ * "Post now") can publish it. Returns null if another caller already claimed it
+ * or it is no longer in one of `fromStatuses`.
+ */
+export async function claimDraftForPosting(
+  id: string,
+  fromStatuses: DraftStatus[],
+  opts: { dueBy?: Date } = {},
+): Promise<Draft | null> {
+  if (!ObjectId.isValid(id)) return null;
+  const db = await getMongo();
+  const filter: Record<string, unknown> = {
+    _id: new ObjectId(id),
+    status: { $in: fromStatuses },
+  };
+  if (opts.dueBy) filter.scheduled_at = { $ne: null, $lte: opts.dueBy };
+  const result = await draftsCol(db).findOneAndUpdate(
+    filter,
+    { $set: { status: "posting", error: null, updated_at: new Date() } },
+    { returnDocument: "after" },
+  );
+  return result ? mapDraft(result) : null;
+}
+
 export async function listDueDrafts(): Promise<Draft[]> {
   const db = await getMongo();
   const now = new Date();
@@ -663,6 +702,43 @@ export async function listDueDrafts(): Promise<Draft[]> {
     .sort({ scheduled_at: 1 })
     .toArray();
   return docs.map(mapDraft);
+}
+
+/**
+ * Uploaded media lives in GridFS so every serverless instance (and the cron
+ * run that publishes later) can read it; local disk / /tmp is per-instance.
+ */
+function mediaBucket(db: Db) {
+  return new GridFSBucket(db, { bucketName: "media" });
+}
+
+export async function saveMedia(
+  filename: string,
+  data: Buffer,
+  contentType: string,
+): Promise<void> {
+  const db = await getMongo();
+  await new Promise<void>((resolve, reject) => {
+    const upload = mediaBucket(db).openUploadStream(filename, {
+      metadata: { contentType },
+    });
+    upload.once("finish", () => resolve());
+    upload.once("error", reject);
+    upload.end(data);
+  });
+}
+
+/** Returns null if no media with this filename exists. */
+export async function readMedia(filename: string): Promise<Buffer | null> {
+  const db = await getMongo();
+  const bucket = mediaBucket(db);
+  const file = await bucket.find({ filename }).limit(1).next();
+  if (!file) return null;
+  const chunks: Buffer[] = [];
+  for await (const chunk of bucket.openDownloadStream(file._id)) {
+    chunks.push(chunk as Buffer);
+  }
+  return Buffer.concat(chunks);
 }
 
 export async function logJob(job: string, status: string, detail?: string) {

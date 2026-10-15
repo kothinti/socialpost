@@ -10,10 +10,22 @@ function authorized(req: NextRequest) {
   return false;
 }
 
+/**
+ * Vercel Cron sends GET with `Authorization: Bearer $CRON_SECRET`. GET accepts
+ * only the bearer secret (not a session cookie) so a plain link can't trigger it.
+ */
+export async function GET(req: NextRequest) {
+  if (!authorized(req)) return unauthorized();
+  return runJob(req);
+}
+
 export async function POST(req: NextRequest) {
   const session = await getSession();
   if (!session && !authorized(req)) return unauthorized();
+  return runJob(req);
+}
 
+async function runJob(req: NextRequest) {
   const url = new URL(req.url);
   const job = url.searchParams.get("job") || "all";
 
