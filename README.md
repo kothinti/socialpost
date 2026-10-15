@@ -1,4 +1,4 @@
-# SocialPost
+# MonfortSocial
 
 Personal workspace for watching X handles / topics, drafting AI replies/posts, and posting or scheduling to a shared X account.
 
@@ -46,11 +46,16 @@ Fill **Settings** (admin):
 
 1. Developer Console → User authentication → **OAuth 2.0**
 2. Type: **Web App**
-3. Callback: `http://127.0.0.1:3000/api/auth/x/callback` (not `localhost`)
-4. Website: `http://127.0.0.1:3000`
-5. Open the app at **http://127.0.0.1:3000** (same host as the callback)
-6. Paste Client ID + Client Secret in Settings → Save → **Connect with X**
-7. Needed scopes: `tweet.read`, `tweet.write`, `users.read`, `offline.access`, `media.write`
+3. App permissions: **Read and write** (needed for posting / media)
+4. Callback URI(s) — add **exact** matches for every host you use:
+   - Local: `http://127.0.0.1:3000/api/auth/x/callback`
+   - Vercel: `https://YOUR-APP.vercel.app/api/auth/x/callback`
+5. Website URL: same origin (e.g. `https://YOUR-APP.vercel.app`)
+6. In MonfortSocial Settings: paste **Client ID** + **Client Secret** → Save
+7. Open the app on that same host → **Connect with X**
+8. Needed scopes: `tweet.read`, `tweet.write`, `users.read`, `offline.access`, `media.write`
+
+If X shows “You weren’t able to give access to the App”, the callback URL in the X console does not exactly match the URL MonfortSocial is using (scheme + host + path).
 
 ## Daily jobs
 
@@ -80,12 +85,28 @@ Or while signed in, call `POST /api/cron` / use **Refresh now** on the Feed tab.
 | `npm run build` / `npm start` | Production |
 | `npm run cron` | Trigger fetch + schedule flush |
 
+## X API rules this app follows
+
+- **Replies:** since Feb 2026, X only accepts API replies to posts that @mention your account (or quote your post). The Mentions tab replies through the API, and the server checks that the post is a stored mention. Replies to any other post open X's own reply box (web intent) so you post them yourself.
+- **Quotes and original posts** go through the API as before, with scheduling and media.
+- **AI:** only your notes are sent to OpenAI, never the X post text (the X Developer Agreement restricts sharing X content with third parties). A person reviews every draft; nothing replies automatically.
+- **Storage:** fetched feed posts are kept for 24 hours and mentions for 7 days.
+- **Cost:** pay-per-use posts cost $0.015, or $0.20 with a link (the composer warns you). Mentions are fetched with your own token, billed as owned reads ($0.001 each), and only new ones are fetched.
+
 ## Notes
 
 - Shared workspace: one X connection, one feed, one draft queue.
 - Secrets live in MongoDB settings; keep your DB private.
-- Media uploads live in `data/uploads/` locally (max 15MB). On Vercel they use `/tmp` (ephemeral).
+- Media uploads are stored in MongoDB (GridFS bucket `media`, max 15MB) so they work on Vercel and survive restarts. Drafts created before this still read from `data/uploads/`. Note Vercel caps request bodies at 4.5MB, so larger files only upload on a VPS deploy.
 - Switching from SQLite: start fresh with MongoDB (no automatic migration).
+
+## Railway
+
+1. New project → Deploy from GitHub repo. Railway detects Next.js and runs `npm run build` / `npm start` (the app listens on Railway's `PORT`).
+2. Variables: `MONGODB_URI`, `AUTH_SECRET`, `CRON_SECRET` (long random strings for the secrets).
+3. Settings → Networking → Generate Domain. In the X developer console set the callback to `https://<your-domain>/api/auth/x/callback`.
+4. Cron: add a second service from the same repo with Start Command `npm run cron`, Cron Schedule `*/5 * * * *`, and variables `APP_URL=https://<your-domain>` and the same `CRON_SECRET`. It calls `/api/cron` (fetch, mentions, due schedules) and exits.
+5. Redirects and the OAuth callback use the proxy's `X-Forwarded-Host` / `X-Forwarded-Proto`, so no extra URL config is needed.
 
 ## Vercel
 
@@ -93,4 +114,5 @@ Or while signed in, call `POST /api/cron` / use **Refresh now** on the Feed tab.
 2. Set env vars: `MONGODB_URI`, `AUTH_SECRET`, `CRON_SECRET` (and optionally `APP_URL` to your `*.vercel.app` URL).
 3. Use a MongoDB Atlas URI that allows Vercel IPs (`0.0.0.0/0` is simplest for serverless).
 4. Redeploy after changing env or framework settings.
-5. Daily cron: use Vercel Cron or an external caller against `POST /api/cron` with `Authorization: Bearer $CRON_SECRET`. Local DigitalOcean/VPS deploy remains the better fit for persistent uploads + cron.
+5. Cron: Vercel Cron calls `GET /api/cron` and sends `Authorization: Bearer $CRON_SECRET` automatically when `CRON_SECRET` is set. External callers can use `GET` or `POST` with the same header. Scheduled posts only go out when cron runs, so run it as often as your plan allows.
+6. `AUTH_SECRET` is required in production; requests that need a session fail until it is set.

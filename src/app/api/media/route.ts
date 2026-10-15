@@ -1,9 +1,7 @@
 import { NextRequest } from "next/server";
-import fs from "fs";
-import path from "path";
 import { randomUUID } from "crypto";
 import { getSession } from "@/lib/auth";
-import { getUploadsDir } from "@/lib/db";
+import { saveMedia } from "@/lib/db";
 import { jsonError, jsonOk, unauthorized } from "@/lib/http";
 
 const ALLOWED = new Set([
@@ -30,16 +28,12 @@ export async function POST(req: NextRequest) {
     return jsonError("File too large (max 15MB for this app)");
   }
 
-  const uploadDir = getUploadsDir();
-  fs.mkdirSync(uploadDir, { recursive: true });
-  const ext = path.extname(file.name) || mimeExt(file.type);
-  const filename = `${Date.now()}-${randomUUID()}${ext}`;
-  const absolute = path.join(uploadDir, filename);
-
+  // Derive the extension from the validated MIME type, not the client's filename.
+  const filename = `${Date.now()}-${randomUUID()}${mimeExt(file.type)}`;
   const buffer = Buffer.from(await file.arrayBuffer());
-  fs.writeFileSync(absolute, buffer);
+  await saveMedia(filename, buffer, file.type);
 
-  // Store filename-only so publish can resolve against getUploadsDir() on any host.
+  // Drafts store the filename only; publish reads it back from GridFS.
   return jsonOk({ path: filename, filename, type: file.type, size: file.size });
 }
 

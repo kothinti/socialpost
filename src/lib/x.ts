@@ -4,12 +4,15 @@ import path from "path";
 import {
   deleteFetchedPostById,
   deleteOldFetchedPosts,
+  deleteOldMentions,
   getSettings,
   getUploadsDir,
   listFetchedPostsSince,
+  readMedia,
   saveOAuthTokens,
   updateSettings,
   upsertFetchedPost,
+  upsertMention,
   type FetchedPost,
   type Settings,
 } from "./db";
@@ -54,8 +57,7 @@ export function formatXError(err: unknown): string {
 }
 
 export async function defaultRedirectUri(reqOrigin?: string) {
-  const s = await getSettings();
-  if (s.x_redirect_uri?.trim()) return s.x_redirect_uri.trim();
+  // Prefer the live request origin so local + Vercel both work without stale settings.
   if (reqOrigin) {
     try {
       const u = new URL(reqOrigin);
@@ -65,6 +67,20 @@ export async function defaultRedirectUri(reqOrigin?: string) {
       /* fall through */
     }
   }
+
+  const s = await getSettings();
+  if (s.x_redirect_uri?.trim()) return s.x_redirect_uri.trim();
+
+  const appUrl = process.env.APP_URL?.trim() || process.env.VERCEL_URL?.trim();
+  if (appUrl) {
+    const base = appUrl.startsWith("http") ? appUrl : `https://${appUrl}`;
+    try {
+      return `${new URL(base).origin}/api/auth/x/callback`;
+    } catch {
+      /* fall through */
+    }
+  }
+
   return "http://127.0.0.1:3000/api/auth/x/callback";
 }
 
@@ -147,9 +163,11 @@ export async function completeOAuth2Login(opts: {
   });
 
   let handle: string | undefined;
+  let userId: string | undefined;
   try {
     const me = await result.client.v2.me({ "user.fields": ["username"] });
     handle = me.data?.username;
+    userId = me.data?.id;
   } catch {
     /* optional */
   }
@@ -159,6 +177,7 @@ export async function completeOAuth2Login(opts: {
     refreshToken: result.refreshToken,
     expiresIn: result.expiresIn,
     handle: handle ?? null,
+    userId: userId ?? null,
   });
 
   return { handle, accessToken: result.accessToken };
@@ -175,9 +194,12 @@ export async function verifyXWriteAuth(): Promise<{
     if (!me.data?.id) {
       return { ok: false, message: "X returned no user for these credentials" };
     }
-    if (me.data.username) {
-      await updateSettings({ x_connected_handle: me.data.username });
-    }
+    const s = await getSettings();
+    await updateSettings({
+      x_connected_handle: me.data.username || s.x_connected_handle,
+      x_connected_user_id: me.data.id,
+      ...(s.x_connected_user_id !== me.data.id ? { mentions_since_id: "" } : {}),
+    });
     return {
       ok: true,
       user: {
@@ -380,7 +402,8 @@ export async function fetchWatchedPostsLast24h(): Promise<{
     throw new Error(formatXError(err));
   }
 
-  await deleteOldFetchedPosts(48);
+  // Keep stored X content short-lived (Developer Policy: stored content must stay current).
+  await deleteOldFetchedPosts(24);
 
   const stale = await listFetchedPostsSince(24, 500);
   for (const row of stale) {
@@ -399,17 +422,92 @@ export async function fetchWatchedPostsLast24h(): Promise<{
   };
 }
 
-export async function uploadMediaFiles(absolutePaths: string[]): Promise<string[]> {
-  if (absolutePaths.length === 0) return [];
+async function getConnectedUserId(): Promise<string> {
+  const s = await getSettings();
+  if (s.x_connected_user_id) return s.x_connected_user_id;
+  const client = await getWriteClient();
+  const me = await client.v2.me();
+  if (!me.data?.id) throw new Error("X returned no user for the connected account");
+  await updateSettings({ x_connected_user_id: me.data.id });
+  return me.data.id;
+}
+
+/**
+ * Pull new posts that @mention the connected account. These are the only posts
+ * X lets this app reply to via the API. Uses the account's own user token so X
+ * bills them as owned reads ($0.001 each), and `since_id` so each run only pays
+ * for mentions it hasn't seen.
+ */
+export async function fetchMentions(): Promise<{ fetched: number; skipped?: string }> {
+  const settings = await getSettings();
+  if (!settings.enable_mentions) return { fetched: 0, skipped: "disabled" };
+  if (!settings.x_access_token) return { fetched: 0, skipped: "not connected" };
+
+  try {
+    const userId = await getConnectedUserId();
+    const client = await getWriteClient();
+    const maxResults = Math.min(100, Math.max(5, settings.mentions_max_results));
+
+    const page = await client.v2.userMentionTimeline(userId, {
+      max_results: maxResults,
+      ...(settings.mentions_since_id ? { since_id: settings.mentions_since_id } : {}),
+      "tweet.fields": ["created_at", "author_id"],
+      expansions: ["author_id"],
+      "user.fields": ["username", "name"],
+    });
+
+    const usersById = new Map<string, { username: string; name?: string }>();
+    for (const u of page.includes?.users ?? []) {
+      usersById.set(u.id, { username: u.username, name: u.name });
+    }
+
+    for (const tweet of page.tweets) {
+      const author = tweet.author_id ? usersById.get(tweet.author_id) : undefined;
+      await upsertMention({
+        x_post_id: tweet.id,
+        author_handle: author?.username ?? "unknown",
+        author_name: author?.name ?? null,
+        content: tweet.text,
+        posted_at: tweet.created_at ?? null,
+      });
+    }
+
+    if (page.meta?.newest_id) {
+      await updateSettings({ mentions_since_id: page.meta.newest_id });
+    }
+    await deleteOldMentions(7);
+
+    return { fetched: page.tweets.length };
+  } catch (err) {
+    throw new Error(formatXError(err));
+  }
+}
+
+/**
+ * Media paths come from the client, so only ever use the basename. New uploads
+ * live in GridFS; older drafts may reference files in the local uploads dir
+ * (stored as a bare name, data/uploads/..., or an absolute path).
+ */
+async function loadMedia(p: string): Promise<Buffer> {
+  const base = path.basename(p);
+  if (!base || base === "." || base === "..") {
+    throw new Error(`Invalid media path: ${p}`);
+  }
+  const stored = await readMedia(base);
+  if (stored) return stored;
+  const legacy = path.join(getUploadsDir(), base);
+  if (fs.existsSync(legacy)) return fs.readFileSync(legacy);
+  throw new Error(`Media file missing: ${base}`);
+}
+
+export async function uploadMediaFiles(mediaPaths: string[]): Promise<string[]> {
+  if (mediaPaths.length === 0) return [];
   const client = await getWriteClient();
   const mediaIds: string[] = [];
 
-  for (const filePath of absolutePaths) {
-    if (!fs.existsSync(filePath)) {
-      throw new Error(`Media file missing: ${filePath}`);
-    }
-    const buffer = fs.readFileSync(filePath);
-    const { media_type, media_category } = mimeForFile(filePath);
+  for (const p of mediaPaths) {
+    const buffer = await loadMedia(p);
+    const { media_type, media_category } = mimeForFile(p);
     const mediaId = await client.v2.uploadMedia(buffer, {
       media_type,
       media_category,
@@ -420,28 +518,20 @@ export async function uploadMediaFiles(absolutePaths: string[]): Promise<string[
   return mediaIds;
 }
 
-function resolveMediaPath(p: string) {
-  if (path.isAbsolute(p)) return p;
-  // New uploads store bare filenames; older drafts may store data/uploads/...
-  const base = path.basename(p);
-  const inUploads = path.join(getUploadsDir(), base);
-  if (fs.existsSync(inUploads)) return inUploads;
-  return path.join(/*turbopackIgnore: true*/ process.cwd(), p);
-}
-
 export async function publishPost(opts: {
   text: string;
   replyToId?: string | null;
+  quoteTweetId?: string | null;
   mediaPaths?: string[];
 }): Promise<string> {
   try {
-    const client = await getWriteClient();
-    const absolute = (opts.mediaPaths ?? []).map(resolveMediaPath);
-    const mediaIds = await uploadMediaFiles(absolute);
-
-    if (mediaIds.length > 4) {
+    const mediaPaths = opts.mediaPaths ?? [];
+    if (mediaPaths.length > 4) {
       throw new Error("X allows at most 4 media attachments");
     }
+
+    const client = await getWriteClient();
+    const mediaIds = await uploadMediaFiles(mediaPaths);
 
     type MediaTuple =
       | [string]
@@ -452,11 +542,15 @@ export async function publishPost(opts: {
     const payload: {
       text: string;
       reply?: { in_reply_to_tweet_id: string };
+      quote_tweet_id?: string;
       media?: { media_ids: MediaTuple };
     } = { text: opts.text };
 
     if (opts.replyToId) {
       payload.reply = { in_reply_to_tweet_id: opts.replyToId };
+    }
+    if (opts.quoteTweetId) {
+      payload.quote_tweet_id = opts.quoteTweetId;
     }
     if (mediaIds.length > 0) {
       payload.media = { media_ids: mediaIds as MediaTuple };
@@ -466,6 +560,11 @@ export async function publishPost(opts: {
     if (!result.data?.id) throw new Error("X API returned no post id");
     return result.data.id;
   } catch (err) {
+    if (opts.replyToId && err instanceof ApiResponseError && err.code === 403) {
+      throw new Error(
+        "X refused this reply. The API only allows replies to posts that @mention your account or quote your post. Use Open in X to reply manually.",
+      );
+    }
     throw new Error(formatXError(err));
   }
 }

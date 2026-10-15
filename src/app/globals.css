@@ -1,24 +1,30 @@
 @import "tailwindcss";
 
+/* Monfort brand palette (monfortcompanies.com global colors). */
 :root {
-  --bg: #050505;
-  --bg-elevated: #0c0c0c;
-  --bg-soft: #111111;
-  --border: #1f1f1f;
-  --border-strong: #2a2a2a;
-  --text: #f4f4f4;
-  --muted: #8b8b8b;
-  --accent: #d6ff4b;
-  --accent-ink: #0a0a0a;
-  --danger: #ff6b6b;
-  --ok: #7dffb3;
+  --bg: #f2f4ee;
+  --bg-elevated: #f9faf7;
+  --bg-soft: #e8e4dd;
+  --border: #e3dfd7;
+  --border-strong: #c5c3c2;
+  --text: #333e48;
+  --muted: #6b7178;
+  /* Rust: brand, headings, rules. */
+  --brand: #b8462c;
+  --brand-dark: #833220;
+  /* Teal: buttons, active tabs, focus (the site's call-to-action style). */
+  --accent: #added6;
+  --accent-strong: #67c6ba;
+  --accent-ink: #333e48;
+  --danger: #c62828;
+  --ok: #2e7d5b;
 }
 
 @theme inline {
   --color-background: var(--bg);
   --color-foreground: var(--text);
-  --font-sans: var(--font-outfit);
-  --font-display: var(--font-syne);
+  --font-sans: var(--font-montserrat);
+  --font-serif: var(--font-radley);
   --font-mono: var(--font-ibm);
 }
 
@@ -32,17 +38,14 @@ body {
 }
 
 body {
-  background:
-    radial-gradient(1200px 600px at 10% -10%, #14180a 0%, transparent 55%),
-    radial-gradient(900px 500px at 100% 0%, #0d1210 0%, transparent 50%),
-    var(--bg);
+  background: var(--bg);
   color: var(--text);
-  font-family: var(--font-outfit), sans-serif;
+  font-family: var(--font-montserrat), sans-serif;
 }
 
 ::selection {
-  background: color-mix(in oklab, var(--accent) 40%, black);
-  color: var(--text);
+  background: var(--accent);
+  color: var(--accent-ink);
 }
 
 input,
@@ -52,25 +55,46 @@ select {
   font: inherit;
 }
 
+/* Section headings follow the site: bold uppercase Montserrat in rust. */
+h1,
+h2,
+h3 {
+  color: var(--brand);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+/* Supporting copy in the site's serif. */
+.tagline {
+  font-family: var(--font-radley), serif;
+  color: var(--brand);
+}
+
 .panel {
-  background: color-mix(in oklab, var(--bg-elevated) 92%, transparent);
+  background: var(--bg-elevated);
   border: 1px solid var(--border);
-  border-radius: 16px;
+  border-radius: 6px;
 }
 
 .field {
   width: 100%;
-  background: var(--bg-soft);
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  background: #ffffff;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
   color: var(--text);
   padding: 0.7rem 0.85rem;
   outline: none;
-  transition: border-color 120ms ease;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.field::placeholder {
+  color: #9a9fa4;
 }
 
 .field:focus {
-  border-color: color-mix(in oklab, var(--accent) 55%, var(--border));
+  border-color: var(--accent-strong);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 55%, transparent);
 }
 
 .btn {
@@ -78,11 +102,13 @@ select {
   align-items: center;
   justify-content: center;
   gap: 0.4rem;
-  border-radius: 999px;
+  border-radius: 3px;
   border: 1px solid transparent;
   padding: 0.55rem 1rem;
-  font-weight: 560;
-  letter-spacing: 0.01em;
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
   cursor: pointer;
   transition: transform 120ms ease, background 120ms ease, border-color 120ms ease, opacity 120ms ease;
 }
@@ -98,7 +124,12 @@ select {
 
 .btn-primary {
   background: var(--accent);
+  border-color: var(--accent-strong);
   color: var(--accent-ink);
+}
+
+.btn-primary:not(:disabled):hover {
+  background: color-mix(in oklab, var(--accent) 80%, var(--accent-strong));
 }
 
 .btn-ghost {
@@ -108,12 +139,13 @@ select {
 }
 
 .btn-ghost:not(:disabled):hover {
-  border-color: color-mix(in oklab, var(--accent) 40%, var(--border-strong));
+  border-color: var(--brand);
+  color: var(--brand);
 }
 
 .btn-danger {
   background: transparent;
-  border-color: color-mix(in oklab, var(--danger) 50%, var(--border));
+  border-color: color-mix(in oklab, var(--danger) 45%, var(--border));
   color: var(--danger);
 }
 
@@ -137,16 +169,21 @@ select {
 }
 
 .feed-item {
+  background: #ffffff;
   transition: background 140ms ease, border-color 140ms ease;
 }
 
+.feed-item:hover {
+  border-color: var(--border-strong) !important;
+}
+
 .feed-item[data-active="true"] {
-  background: #121412;
-  border-color: color-mix(in oklab, var(--accent) 35%, var(--border));
+  background: color-mix(in oklab, var(--accent) 22%, #ffffff);
+  border-color: var(--accent-strong) !important;
 }
 
 .char-warn {
-  color: #ffb454;
+  color: #a8650f;
 }
 
 .char-over {

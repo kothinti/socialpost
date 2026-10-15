@@ -1,8 +1,21 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import Image from "next/image";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-type Tab = "feed" | "compose" | "queue" | "settings";
+type Tab = "feed" | "mentions" | "compose" | "queue" | "settings";
+
+type ComposerMode = "reply" | "quote" | "original";
+
+type SettingsTab = "x" | "ai" | "feed" | "mentions" | "users";
+
+const SETTINGS_TABS: [SettingsTab, string][] = [
+  ["x", "X account"],
+  ["ai", "AI"],
+  ["feed", "Feed"],
+  ["mentions", "Mentions"],
+  ["users", "Users"],
+];
 
 type FeedPost = {
   id: string;
@@ -17,15 +30,34 @@ type FeedPost = {
   posted_at: string | null;
 };
 
+/** A post that @mentions the connected account: the only kind X lets us reply to via API. */
+type Mention = {
+  id: string;
+  x_post_id: string;
+  author_handle: string;
+  author_name: string | null;
+  content: string;
+  posted_at: string | null;
+  replied_x_post_id: string | null;
+};
+
+/** Post being replied to or quoted, and where it came from. */
+type Target = {
+  source: "feed" | "mention";
+  x_post_id: string;
+  author_handle: string;
+  content: string;
+};
+
 type Draft = {
   id: string;
-  type: "reply" | "original";
+  type: ComposerMode;
   reply_to_x_id: string | null;
   reply_to_handle: string | null;
   reply_to_content: string | null;
   content: string;
   media_paths: string[];
-  status: "draft" | "scheduled" | "posted" | "failed";
+  status: "draft" | "scheduled" | "posting" | "posted" | "failed";
   scheduled_at: string | null;
   posted_at: string | null;
   x_post_id: string | null;
@@ -45,6 +77,8 @@ type Settings = {
   min_reply_count: number;
   min_repost_count: number;
   enable_topic_search: boolean;
+  enable_mentions: boolean;
+  mentions_max_results: number;
   has_x_client_id: boolean;
   has_x_client_secret: boolean;
   has_x_bearer_token: boolean;
@@ -93,12 +127,15 @@ function formatWhen(iso: string | null) {
 }
 
 function toLocalInputValue(iso: string | null) {
-  if (!iso) {
-    const d = new Date(Date.now() + 60 * 60 * 1000);
+  // Default: the next full hour. datetime-local inputs take local time, so shift
+  // by the timezone offset before formatting (toISOString alone would be UTC).
+  let d: Date;
+  if (iso) {
+    d = new Date(iso.endsWith("Z") || iso.includes("+") || iso.includes("T") ? iso : iso + "Z");
+  } else {
+    d = new Date(Date.now() + 60 * 60 * 1000);
     d.setMinutes(0, 0, 0);
-    return d.toISOString().slice(0, 16);
   }
-  const d = new Date(iso.endsWith("Z") || iso.includes("+") || iso.includes("T") ? iso : iso + "Z");
   const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
   return local.toISOString().slice(0, 16);
 }
@@ -107,9 +144,22 @@ function fromLocalInputValue(value: string) {
   return new Date(value).toISOString();
 }
 
+/** X web intent: opens X's own reply box with the text prefilled; the user clicks Post. */
+function replyIntentUrl(inReplyTo: string, text: string) {
+  const params = new URLSearchParams({ in_reply_to: inReplyTo, text });
+  return `https://x.com/intent/tweet?${params.toString()}`;
+}
+
+/** X auto-links bare domains too, and a post with a link costs $0.20 instead of $0.015. */
+function containsLink(text: string) {
+  return /(https?:\/\/|www\.)\S+|\b[a-z0-9-]+\.(com|net|org|io|ai|co|dev|app|me|xyz)\b/i.test(text);
+}
+
 export default function HomePage() {
-  const [tab, setTab] = useState<Tab>("feed");
+  const [tab, setTab] = useState<Tab>("compose");
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("x");
   const [posts, setPosts] = useState<FeedPost[]>([]);
+  const [mentions, setMentions] = useState<Mention[]>([]);
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [sessionUser, setSessionUser] = useState<SessionUser | null>(null);
@@ -119,11 +169,10 @@ export default function HomePage() {
     password: "",
     role: "posting" as "admin" | "posting",
   });
-  const [selected, setSelected] = useState<FeedPost | null>(null);
-  const [composerMode, setComposerMode] = useState<"reply" | "original">("reply");
+  const [target, setTarget] = useState<Target | null>(null);
+  const [composerMode, setComposerMode] = useState<ComposerMode>("original");
   const [content, setContent] = useState("");
-  const [instruction, setInstruction] = useState("");
-  const [originalPrompt, setOriginalPrompt] = useState("");
+  const [notes, setNotes] = useState("");
   const [mediaPaths, setMediaPaths] = useState<string[]>([]);
   const [scheduleAt, setScheduleAt] = useState(toLocalInputValue(null));
   const [busy, setBusy] = useState<string | null>(null);
@@ -146,16 +195,20 @@ export default function HomePage() {
     min_reply_count: 0,
     min_repost_count: 0,
     enable_topic_search: false,
+    enable_mentions: true,
+    mentions_max_results: 20,
   });
 
   const loadAll = useCallback(async () => {
-    const [feed, draftData, settingsData, me] = await Promise.all([
+    const [feed, mentionData, draftData, settingsData, me] = await Promise.all([
       api<{ posts: FeedPost[] }>("/api/feed"),
+      api<{ mentions: Mention[] }>("/api/mentions"),
       api<{ drafts: Draft[] }>("/api/drafts"),
       api<Settings>("/api/settings"),
       api<{ authenticated: boolean; user: SessionUser | null }>("/api/auth/me"),
     ]);
     setPosts(feed.posts);
+    setMentions(mentionData.mentions);
     setDrafts(draftData.drafts);
     setSettings(settingsData);
     setSessionUser(me.user);
@@ -173,6 +226,8 @@ export default function HomePage() {
       min_reply_count: settingsData.min_reply_count,
       min_repost_count: settingsData.min_repost_count,
       enable_topic_search: settingsData.enable_topic_search,
+      enable_mentions: settingsData.enable_mentions,
+      mentions_max_results: settingsData.mentions_max_results,
     }));
 
     if (me.user?.role === "admin") {
@@ -192,7 +247,13 @@ export default function HomePage() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const tabParam = params.get("tab");
-    if (tabParam === "settings" || tabParam === "feed" || tabParam === "compose" || tabParam === "queue") {
+    if (
+      tabParam === "settings" ||
+      tabParam === "feed" ||
+      tabParam === "mentions" ||
+      tabParam === "compose" ||
+      tabParam === "queue"
+    ) {
       setTab(tabParam);
     }
     const xerror = params.get("xerror");
@@ -213,7 +274,7 @@ export default function HomePage() {
     charCount > 280 ? "char-over" : charCount > 240 ? "char-warn" : "muted";
 
   const queue = useMemo(
-    () => drafts.filter((d) => d.status === "scheduled" || d.status === "failed" || d.status === "draft"),
+    () => drafts.filter((d) => d.status !== "posted"),
     [drafts],
   );
 
@@ -222,11 +283,15 @@ export default function HomePage() {
     setTimeout(() => setNotice(null), 3200);
   }
 
-  function selectPost(post: FeedPost) {
-    setSelected(post);
+  function selectTarget(post: FeedPost | Mention, source: Target["source"]) {
+    setTarget({
+      source,
+      x_post_id: post.x_post_id,
+      author_handle: post.author_handle,
+      content: post.content,
+    });
     setComposerMode("reply");
-    setTab("feed");
-    setInstruction("");
+    setNotes("");
   }
 
   async function refreshFeed() {
@@ -245,37 +310,52 @@ export default function HomePage() {
     }
   }
 
+  async function refreshMentions() {
+    setBusy("refresh-mentions");
+    setError(null);
+    try {
+      const result = await api<{ fetched: number; skipped?: string }>(
+        "/api/mentions/refresh",
+        { method: "POST" },
+      );
+      await loadAll();
+      flash(
+        result.skipped
+          ? `Mentions skipped (${result.skipped})`
+          : `${result.fetched} new mention${result.fetched === 1 ? "" : "s"}`,
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Refresh failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function generate() {
     setBusy("generate");
     setError(null);
     try {
-      if (composerMode === "reply") {
-        if (!selected) throw new Error("Select a post first");
-        const data = await api<{ text: string }>("/api/compose", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            mode: "reply",
-            postContent: selected.content,
-            authorHandle: selected.author_handle,
-            instruction: instruction || undefined,
-          }),
-        });
-        setContent(data.text);
-      } else {
-        if (!originalPrompt.trim()) throw new Error("Add a prompt for the model");
-        const data = await api<{ text: string }>("/api/compose", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mode: "original", prompt: originalPrompt }),
-        });
-        setContent(data.text);
-      }
+      if (!notes.trim()) throw new Error("Add some notes for the AI first");
+      const data = await api<{ text: string }>("/api/compose", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: composerMode, notes }),
+      });
+      setContent(data.text);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Compose failed");
     } finally {
       setBusy(null);
     }
+  }
+
+  function openReplyInX() {
+    if (!target) return;
+    if (content.length > 280) {
+      setError("X's reply box takes at most 280 characters");
+      return;
+    }
+    window.open(replyIntentUrl(target.x_post_id, content), "_blank", "noopener,noreferrer");
   }
 
   async function uploadMedia(file: File) {
@@ -298,8 +378,16 @@ export default function HomePage() {
       setError("Write something first");
       return;
     }
-    if (composerMode === "reply" && !selected) {
-      setError("Select a post to reply to");
+    if (action === "schedule" && new Date(scheduleAt).getTime() <= Date.now()) {
+      setError("Pick a time in the future to schedule");
+      return;
+    }
+    if (composerMode !== "original" && !target) {
+      setError("Select a post first");
+      return;
+    }
+    if (composerMode === "reply" && target?.source !== "mention") {
+      setError("X only allows API replies to posts that mention you. Use Open in X.");
       return;
     }
 
@@ -313,9 +401,8 @@ export default function HomePage() {
           type: composerMode,
           content,
           media_paths: mediaPaths,
-          reply_to_x_id: selected?.x_post_id,
-          reply_to_handle: selected?.author_handle,
-          reply_to_content: selected?.content,
+          reply_to_x_id: composerMode === "original" ? undefined : target?.x_post_id,
+          reply_to_handle: composerMode === "original" ? undefined : target?.author_handle,
           status: action === "schedule" ? "scheduled" : "draft",
           scheduled_at: action === "schedule" ? fromLocalInputValue(scheduleAt) : null,
         }),
@@ -336,9 +423,9 @@ export default function HomePage() {
 
       setContent("");
       setMediaPaths([]);
-      setInstruction("");
+      setNotes("");
       await loadAll();
-      if (action !== "draft") setTab("queue");
+      if (action !== "draft" && tab !== "compose") setTab("queue");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Action failed");
     } finally {
@@ -385,6 +472,8 @@ export default function HomePage() {
         min_reply_count: Number(settingsForm.min_reply_count) || 0,
         min_repost_count: Number(settingsForm.min_repost_count) || 0,
         enable_topic_search: settingsForm.enable_topic_search,
+        enable_mentions: settingsForm.enable_mentions,
+        mentions_max_results: Number(settingsForm.mentions_max_results) || 20,
         reply_system_prompt: settingsForm.reply_system_prompt,
         compose_system_prompt: settingsForm.compose_system_prompt,
       };
@@ -415,6 +504,8 @@ export default function HomePage() {
         min_reply_count: updated.min_reply_count,
         min_repost_count: updated.min_repost_count,
         enable_topic_search: updated.enable_topic_search,
+        enable_mentions: updated.enable_mentions,
+        mentions_max_results: updated.mentions_max_results,
       }));
       flash("Settings saved");
     } catch (err) {
@@ -483,7 +574,7 @@ export default function HomePage() {
   }
 
   const isAdmin = sessionUser?.role === "admin";
-  const activeTab = !isAdmin && tab === "settings" ? "feed" : tab;
+  const activeTab = !isAdmin && tab === "settings" ? "compose" : tab;
 
   function connectX() {
     window.location.href = "/api/auth/x/start";
@@ -497,48 +588,42 @@ export default function HomePage() {
   return (
     <main className="min-h-screen px-4 py-6 md:px-8 md:py-8">
       <div className="mx-auto max-w-7xl fade-in">
-        <header className="flex flex-wrap items-end justify-between gap-4 mb-8">
+        <header
+          className="flex flex-wrap items-end justify-between gap-4 mb-8 pb-6 border-b"
+          style={{ borderColor: "var(--brand)" }}
+        >
           <div>
-            <h1
-              className="text-4xl md:text-5xl tracking-tight"
-              style={{ fontFamily: "var(--font-syne), sans-serif" }}
-            >
-              SocialPost
+            <h1 className="flex items-center gap-2.5">
+              <Image
+                src="/monfort-logo.svg"
+                alt="Monfort"
+                width={741}
+                height={166}
+                priority
+                className="h-8 md:h-[38px] w-auto"
+              />
+              <span className="text-[19px] md:text-2xl">Social</span>
             </h1>
-            <p className="muted mt-2 text-sm md:text-base max-w-xl">
-              Pull last-day posts, draft AI replies, and post or schedule to your handle.
+            <p className="tagline mt-3 text-base md:text-lg md:whitespace-nowrap">
+              Write and schedule posts, quote what you&apos;re reading, and answer people who mention you.
             </p>
           </div>
-          <div className="flex items-center gap-2">
-            {sessionUser ? (
-              <span
-                className="muted text-sm px-3 py-1.5 rounded-full border"
-                style={{ borderColor: "var(--border-strong)" }}
-              >
-                {sessionUser.email} · {sessionUser.role}
-              </span>
-            ) : null}
-            {settings?.own_handle ? (
-              <span
-                className="muted text-sm px-3 py-1.5 rounded-full border"
-                style={{ borderColor: "var(--border-strong)", fontFamily: "var(--font-ibm), monospace" }}
-              >
-                @{settings.own_handle}
-              </span>
-            ) : null}
-            <button className="btn btn-ghost" onClick={logout} type="button">
-              Sign out
-            </button>
-          </div>
+          <ProfileMenu
+            user={sessionUser}
+            handle={settings?.own_handle ?? ""}
+            settingsActive={activeTab === "settings"}
+            onSettings={isAdmin ? () => setTab("settings") : null}
+            onSignOut={logout}
+          />
         </header>
 
         <nav className="flex flex-wrap gap-2 mb-6">
           {(
             [
-              ["feed", "Feed"],
               ["compose", "Compose"],
+              ["mentions", "Mentions"],
+              ["feed", "Feed"],
               ["queue", "Queue"],
-              ...(isAdmin ? [["settings", "Settings"] as const] : []),
             ] as const
           ).map(([id, label]) => (
             <button
@@ -548,6 +633,8 @@ export default function HomePage() {
               onClick={() => {
                 setTab(id);
                 if (id === "compose") setComposerMode("original");
+                // Feed and Mentions start in reply mode, not the Compose tab's "original".
+                if (id === "feed" || id === "mentions") setComposerMode("reply");
               }}
               style={
                 activeTab === id
@@ -576,7 +663,7 @@ export default function HomePage() {
             <div className="panel p-4 md:p-5">
               <div className="flex items-center justify-between gap-3 mb-4">
                 <div>
-                  <h2 className="text-lg" style={{ fontFamily: "var(--font-syne), sans-serif" }}>
+                  <h2 className="text-lg">
                     Last 24 hours
                   </h2>
                   <p className="muted text-sm">
@@ -627,8 +714,8 @@ export default function HomePage() {
                       type="button"
                       className="feed-item w-full text-left rounded-xl border p-4"
                       style={{ borderColor: "var(--border)" }}
-                      data-active={selected?.x_post_id === post.x_post_id}
-                      onClick={() => selectPost(post)}
+                      data-active={target?.x_post_id === post.x_post_id}
+                      onClick={() => selectTarget(post, "feed")}
                     >
                       <div className="flex items-baseline justify-between gap-3 mb-2">
                         <span style={{ fontFamily: "var(--font-ibm), monospace" }} className="text-sm">
@@ -651,13 +738,11 @@ export default function HomePage() {
             <Composer
               mode={composerMode}
               setMode={setComposerMode}
-              selected={selected}
+              target={target?.source === "feed" ? target : null}
               content={content}
               setContent={setContent}
-              instruction={instruction}
-              setInstruction={setInstruction}
-              originalPrompt={originalPrompt}
-              setOriginalPrompt={setOriginalPrompt}
+              notes={notes}
+              setNotes={setNotes}
               mediaPaths={mediaPaths}
               setMediaPaths={setMediaPaths}
               scheduleAt={scheduleAt}
@@ -668,23 +753,100 @@ export default function HomePage() {
               onGenerate={generate}
               onUpload={uploadMedia}
               onAct={saveAndAct}
+              onOpenInX={openReplyInX}
+            />
+          </section>
+        )}
+
+        {activeTab === "mentions" && (
+          <section className="grid lg:grid-cols-[1.1fr_0.9fr] gap-4">
+            <div className="panel p-4 md:p-5">
+              <div className="flex items-center justify-between gap-3 mb-4">
+                <div>
+                  <h2 className="text-lg">
+                    Mentions
+                  </h2>
+                  <p className="muted text-sm">
+                    {settings?.enable_mentions === false
+                      ? "Mentions inbox is off in Settings"
+                      : "Posts that @mention you, the only posts X lets this app reply to"}
+                  </p>
+                </div>
+                <button
+                  className="btn btn-ghost"
+                  type="button"
+                  onClick={refreshMentions}
+                  disabled={busy === "refresh-mentions" || settings?.enable_mentions === false}
+                >
+                  {busy === "refresh-mentions" ? "Fetching…" : "Check mentions"}
+                </button>
+              </div>
+
+              <div className="space-y-2 max-h-[70vh] overflow-auto pr-1">
+                {mentions.length === 0 ? (
+                  <p className="muted text-sm py-10 text-center">
+                    No mentions yet. Connect X in Settings, then check mentions.
+                  </p>
+                ) : (
+                  mentions.map((m) => (
+                    <button
+                      key={m.x_post_id}
+                      type="button"
+                      className="feed-item w-full text-left rounded-xl border p-4"
+                      style={{ borderColor: "var(--border)" }}
+                      data-active={target?.x_post_id === m.x_post_id}
+                      onClick={() => selectTarget(m, "mention")}
+                    >
+                      <div className="flex items-baseline justify-between gap-3 mb-2">
+                        <span style={{ fontFamily: "var(--font-ibm), monospace" }} className="text-sm">
+                          @{m.author_handle}
+                        </span>
+                        <span className="muted text-xs">
+                          {m.replied_x_post_id ? "replied · " : ""}
+                          {formatWhen(m.posted_at)}
+                        </span>
+                      </div>
+                      <p className="text-sm leading-relaxed whitespace-pre-wrap">{m.content}</p>
+                    </button>
+                  ))
+                )}
+              </div>
+            </div>
+
+            <Composer
+              mode={composerMode}
+              setMode={setComposerMode}
+              target={target?.source === "mention" ? target : null}
+              content={content}
+              setContent={setContent}
+              notes={notes}
+              setNotes={setNotes}
+              mediaPaths={mediaPaths}
+              setMediaPaths={setMediaPaths}
+              scheduleAt={scheduleAt}
+              setScheduleAt={setScheduleAt}
+              charClass={charClass}
+              charCount={charCount}
+              busy={busy}
+              onGenerate={generate}
+              onUpload={uploadMedia}
+              onAct={saveAndAct}
+              onOpenInX={openReplyInX}
             />
           </section>
         )}
 
         {activeTab === "compose" && (
-          <section className="max-w-2xl">
+          <section className="grid lg:grid-cols-[1.1fr_0.9fr] gap-4 items-start">
             <Composer
               mode="original"
               setMode={() => setComposerMode("original")}
-              selected={null}
+              target={null}
               forceOriginal
               content={content}
               setContent={setContent}
-              instruction={instruction}
-              setInstruction={setInstruction}
-              originalPrompt={originalPrompt}
-              setOriginalPrompt={setOriginalPrompt}
+              notes={notes}
+              setNotes={setNotes}
               mediaPaths={mediaPaths}
               setMediaPaths={setMediaPaths}
               scheduleAt={scheduleAt}
@@ -695,13 +857,20 @@ export default function HomePage() {
               onGenerate={generate}
               onUpload={uploadMedia}
               onAct={saveAndAct}
+              onOpenInX={openReplyInX}
+            />
+            <SchedulePanel
+              drafts={drafts}
+              busy={busy}
+              onAction={draftAction}
+              onViewQueue={() => setTab("queue")}
             />
           </section>
         )}
 
         {activeTab === "queue" && (
           <section className="panel p-4 md:p-5">
-            <h2 className="text-lg mb-1" style={{ fontFamily: "var(--font-syne), sans-serif" }}>
+            <h2 className="text-lg mb-1">
               Queue
             </h2>
             <p className="muted text-sm mb-5">Drafts, schedules, and recent failures</p>
@@ -724,7 +893,11 @@ export default function HomePage() {
                           {d.status}
                         </span>
                         <span className="muted">
-                          {d.type === "reply" ? `Reply to @${d.reply_to_handle}` : "Original"}
+                          {d.type === "reply"
+                            ? `Reply to @${d.reply_to_handle}`
+                            : d.type === "quote"
+                              ? `Quote of @${d.reply_to_handle}`
+                              : "Original"}
                         </span>
                       </div>
                       <span className="muted text-xs">
@@ -740,7 +913,7 @@ export default function HomePage() {
                       </p>
                     ) : null}
                     <div className="flex gap-2">
-                      {d.status !== "posted" ? (
+                      {d.status !== "posted" && d.status !== "posting" ? (
                         <button
                           className="btn btn-primary"
                           type="button"
@@ -769,366 +942,460 @@ export default function HomePage() {
         {activeTab === "settings" && settings && isAdmin && (
           <section className="panel p-4 md:p-6 max-w-3xl space-y-6">
             <div>
-              <h2 className="text-lg" style={{ fontFamily: "var(--font-syne), sans-serif" }}>
+              <h2 className="text-lg">
                 Settings
               </h2>
-              <p className="muted text-sm">Keys stay on this machine in SQLite. Leave blank to keep existing.</p>
+              <p className="muted text-sm">Keys are stored in MongoDB. Leave blank to keep existing.</p>
             </div>
 
-            <div className="grid md:grid-cols-2 gap-4">
-              <label className="space-y-1.5 block">
-                <span className="text-sm muted">Your handle</span>
-                <input
-                  className="field"
-                  value={settingsForm.own_handle}
-                  onChange={(e) => setSettingsForm({ ...settingsForm, own_handle: e.target.value })}
-                  placeholder="yourhandle"
-                />
-              </label>
-              <label className="space-y-1.5 block">
-                <span className="text-sm muted">OpenAI model</span>
-                <input
-                  className="field"
-                  value={settingsForm.openai_model}
-                  onChange={(e) => setSettingsForm({ ...settingsForm, openai_model: e.target.value })}
-                  placeholder="gpt-4o-mini"
-                />
-              </label>
+            <div className="flex flex-wrap gap-1 border-b pb-3" style={{ borderColor: "var(--border)" }}>
+              {SETTINGS_TABS.map(([id, label]) => (
+                <button
+                  key={id}
+                  type="button"
+                  className="btn"
+                  onClick={() => setSettingsTab(id)}
+                  style={
+                    settingsTab === id
+                      ? { background: "var(--accent)", color: "var(--accent-ink)", padding: "0.35rem 0.8rem" }
+                      : { border: "1px solid var(--border-strong)", padding: "0.35rem 0.8rem" }
+                  }
+                >
+                  {label}
+                </button>
+              ))}
             </div>
 
-            <label className="space-y-1.5 block">
-              <span className="text-sm muted">Watched handles (one per line)</span>
-              <textarea
-                className="field min-h-28"
-                value={handlesText}
-                onChange={(e) => setHandlesText(e.target.value)}
-                placeholder={"@elonmusk\n@openai"}
-              />
-            </label>
-
-            <div className="space-y-4">
-              <div>
-                <h3 className="text-sm" style={{ fontFamily: "var(--font-syne), sans-serif" }}>
-                  Feed filters
-                </h3>
-                <p className="muted text-sm mt-1">
-                  Keep the feed tight so you are not paying X to surface low-signal posts.
-                  Keywords and engagement gates drop posts before they are stored. Topic
-                  search pushes phrase + engagement operators into the X recent-search
-                  query (one call), which is usually cheaper than watching many handles.
-                </p>
-              </div>
-
-              <label className="space-y-1.5 block">
-                <span className="text-sm muted">Topic keywords (one phrase per line)</span>
-                <textarea
-                  className="field min-h-24"
-                  value={keywordsText}
-                  onChange={(e) => setKeywordsText(e.target.value)}
-                  placeholder={"AI agents\nopen source LLM"}
-                />
-              </label>
-
-              <div className="flex flex-col gap-3">
-                <label className="flex items-start gap-2.5 text-sm cursor-pointer">
-                  <input
-                    type="checkbox"
-                    className="mt-0.5"
-                    checked={settingsForm.keyword_exact_match}
-                    onChange={(e) =>
-                      setSettingsForm({
-                        ...settingsForm,
-                        keyword_exact_match: e.target.checked,
-                      })
-                    }
-                  />
-                  <span>
-                    Exact phrase match
-                    <span className="muted block text-xs mt-0.5">
-                      On: post must contain the full phrase. Off: every word in the phrase
-                      may appear in any order.
-                    </span>
-                  </span>
-                </label>
-                <label className="flex items-start gap-2.5 text-sm cursor-pointer">
-                  <input
-                    type="checkbox"
-                    className="mt-0.5"
-                    checked={settingsForm.enable_topic_search}
-                    onChange={(e) =>
-                      setSettingsForm({
-                        ...settingsForm,
-                        enable_topic_search: e.target.checked,
-                      })
-                    }
-                  />
-                  <span>
-                    Also search X for these topics
-                    <span className="muted block text-xs mt-0.5">
-                      Uses recent search with quoted phrases and min engagement operators.
-                      Requires keywords above. Works with or without watched handles.
-                    </span>
-                  </span>
-                </label>
-              </div>
-
-              <div className="grid grid-cols-3 gap-3">
+            {settingsTab === "x" && (
+              <div className="space-y-6">
                 <label className="space-y-1.5 block">
-                  <span className="text-sm muted">Min likes</span>
+                  <span className="text-sm muted">Your handle</span>
                   <input
                     className="field"
-                    type="number"
-                    min={0}
-                    value={settingsForm.min_like_count}
-                    onChange={(e) =>
-                      setSettingsForm({
-                        ...settingsForm,
-                        min_like_count: Math.max(0, Number(e.target.value) || 0),
-                      })
-                    }
+                    value={settingsForm.own_handle}
+                    onChange={(e) => setSettingsForm({ ...settingsForm, own_handle: e.target.value })}
+                    placeholder="yourhandle"
                   />
                 </label>
-                <label className="space-y-1.5 block">
-                  <span className="text-sm muted">Min replies</span>
-                  <input
-                    className="field"
-                    type="number"
-                    min={0}
-                    value={settingsForm.min_reply_count}
-                    onChange={(e) =>
-                      setSettingsForm({
-                        ...settingsForm,
-                        min_reply_count: Math.max(0, Number(e.target.value) || 0),
-                      })
-                    }
-                  />
-                </label>
-                <label className="space-y-1.5 block">
-                  <span className="text-sm muted">Min reposts</span>
-                  <input
-                    className="field"
-                    type="number"
-                    min={0}
-                    value={settingsForm.min_repost_count}
-                    onChange={(e) =>
-                      setSettingsForm({
-                        ...settingsForm,
-                        min_repost_count: Math.max(0, Number(e.target.value) || 0),
-                      })
-                    }
-                  />
-                </label>
-              </div>
-            </div>
 
-            <div>
-              <p className="text-sm muted mb-3">
-                X OAuth 2.0 — save Client ID / Secret, set the callback in X console, then Connect
-              </p>
-              <div className="grid md:grid-cols-2 gap-4">
-                {(
-                  [
-                    ["x_client_id", "Client ID", settings.has_x_client_id],
-                    ["x_client_secret", "Client Secret", settings.has_x_client_secret],
-                    ["x_bearer_token", "Bearer Token (read feed)", settings.has_x_bearer_token],
-                    ["openai_api_key", "OpenAI API Key", settings.has_openai_api_key],
-                  ] as const
-                ).map(([key, label, has]) => (
-                  <label key={key} className="space-y-1.5 block">
-                    <span className="text-sm muted">
-                      {label} {has ? "· saved" : ""}
-                    </span>
+                <div>
+                  <p className="text-sm muted mb-3">
+                    X OAuth 2.0 — save Client ID / Secret, set the callback in X console, then Connect
+                  </p>
+                  <div className="grid md:grid-cols-2 gap-4">
+                    {(
+                      [
+                        ["x_client_id", "Client ID", settings.has_x_client_id],
+                        ["x_client_secret", "Client Secret", settings.has_x_client_secret],
+                        ["x_bearer_token", "Bearer Token (read feed)", settings.has_x_bearer_token],
+                      ] as const
+                    ).map(([key, label, has]) => (
+                      <label key={key} className="space-y-1.5 block">
+                        <span className="text-sm muted">
+                          {label} {has ? "· saved" : ""}
+                        </span>
+                        <input
+                          className="field"
+                          type="password"
+                          autoComplete="off"
+                          value={settingsForm[key]}
+                          onChange={(e) => setSettingsForm({ ...settingsForm, [key]: e.target.value })}
+                          placeholder={has ? "••••••••" : ""}
+                        />
+                      </label>
+                    ))}
+                  </div>
+                  <label className="space-y-1.5 block mt-4">
+                    <span className="text-sm muted">OAuth callback URL (must match X console exactly)</span>
                     <input
                       className="field"
-                      type="password"
-                      autoComplete="off"
-                      value={settingsForm[key]}
-                      onChange={(e) => setSettingsForm({ ...settingsForm, [key]: e.target.value })}
-                      placeholder={has ? "••••••••" : ""}
+                      value={settingsForm.x_redirect_uri}
+                      onChange={(e) =>
+                        setSettingsForm({ ...settingsForm, x_redirect_uri: e.target.value })
+                      }
+                      placeholder="http://127.0.0.1:3000/api/auth/x/callback"
                     />
                   </label>
-                ))}
+                  <p className="text-xs muted mt-2">
+                    In X User authentication settings use type Web App, callback{" "}
+                    <span style={{ fontFamily: "var(--font-ibm), monospace" }}>
+                      {settingsForm.x_redirect_uri || "http://127.0.0.1:3000/api/auth/x/callback"}
+                    </span>
+                    . Prefer <code>127.0.0.1</code> over localhost.
+                  </p>
+                  <p className="text-sm mt-3">
+                    {settings.has_x_user_token ? (
+                      <span style={{ color: "var(--ok)" }}>
+                        Connected{settings.x_connected_handle ? ` as @${settings.x_connected_handle}` : ""}
+                      </span>
+                    ) : (
+                      <span className="muted">Not connected — posting requires Connect with X</span>
+                    )}
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    className="btn btn-ghost"
+                    type="button"
+                    onClick={connectX}
+                    disabled={!settings.has_x_client_id || !settings.has_x_client_secret}
+                  >
+                    Connect with X
+                  </button>
+                  <button
+                    className="btn btn-ghost"
+                    type="button"
+                    onClick={testX}
+                    disabled={busy === "test-x"}
+                  >
+                    {busy === "test-x" ? "Testing…" : "Test X auth"}
+                  </button>
+                </div>
               </div>
-              <label className="space-y-1.5 block mt-4">
-                <span className="text-sm muted">OAuth callback URL (must match X console exactly)</span>
-                <input
-                  className="field"
-                  value={settingsForm.x_redirect_uri}
-                  onChange={(e) =>
-                    setSettingsForm({ ...settingsForm, x_redirect_uri: e.target.value })
-                  }
-                  placeholder="http://127.0.0.1:3000/api/auth/x/callback"
-                />
-              </label>
-              <p className="text-xs muted mt-2">
-                In X User authentication settings use type Web App, callback{" "}
-                <span style={{ fontFamily: "var(--font-ibm), monospace" }}>
-                  {settingsForm.x_redirect_uri || "http://127.0.0.1:3000/api/auth/x/callback"}
-                </span>
-                . Prefer <code>127.0.0.1</code> over localhost.
-              </p>
-              <p className="text-sm mt-3">
-                {settings.has_x_user_token ? (
-                  <span style={{ color: "var(--ok)" }}>
-                    Connected{settings.x_connected_handle ? ` as @${settings.x_connected_handle}` : ""}
+            )}
+            {settingsTab === "ai" && (
+              <div className="space-y-6">
+                <label className="space-y-1.5 block">
+                  <span className="text-sm muted">
+                    OpenAI API Key {settings.has_openai_api_key ? "· saved" : ""}
                   </span>
-                ) : (
-                  <span className="muted">Not connected — posting requires Connect with X</span>
-                )}
-              </p>
-            </div>
-
-            <label className="space-y-1.5 block">
-              <span className="text-sm muted">Reply system prompt (optional)</span>
-              <textarea
-                className="field min-h-24"
-                value={settingsForm.reply_system_prompt}
-                onChange={(e) =>
-                  setSettingsForm({ ...settingsForm, reply_system_prompt: e.target.value })
-                }
-              />
-            </label>
-            <label className="space-y-1.5 block">
-              <span className="text-sm muted">Compose system prompt (optional)</span>
-              <textarea
-                className="field min-h-24"
-                value={settingsForm.compose_system_prompt}
-                onChange={(e) =>
-                  setSettingsForm({ ...settingsForm, compose_system_prompt: e.target.value })
-                }
-              />
-            </label>
-
-            <div className="space-y-4">
-              <div>
-                <h3 className="text-sm" style={{ fontFamily: "var(--font-syne), sans-serif" }}>
-                  Users
-                </h3>
-                <p className="muted text-sm mt-1">
-                  Admin-only. Create posting users who can use Feed / Compose / Queue on the
-                  shared X workspace. They cannot change settings or manage users.
-                </p>
-              </div>
-
-              <div className="grid md:grid-cols-[1.2fr_1fr_auto_auto] gap-3 items-end">
-                <label className="space-y-1.5 block">
-                  <span className="text-sm muted">Email</span>
-                  <input
-                    className="field"
-                    type="email"
-                    value={newUser.email}
-                    onChange={(e) => setNewUser({ ...newUser, email: e.target.value })}
-                    placeholder="teammate@example.com"
-                  />
-                </label>
-                <label className="space-y-1.5 block">
-                  <span className="text-sm muted">Password</span>
                   <input
                     className="field"
                     type="password"
-                    value={newUser.password}
-                    onChange={(e) => setNewUser({ ...newUser, password: e.target.value })}
-                    placeholder="8+ characters"
+                    autoComplete="off"
+                    value={settingsForm.openai_api_key}
+                    onChange={(e) => setSettingsForm({ ...settingsForm, openai_api_key: e.target.value })}
+                    placeholder={settings.has_openai_api_key ? "••••••••" : ""}
+                  />
+                </label>
+
+                <label className="space-y-1.5 block">
+                  <span className="text-sm muted">OpenAI model</span>
+                  <input
+                    className="field"
+                    value={settingsForm.openai_model}
+                    onChange={(e) => setSettingsForm({ ...settingsForm, openai_model: e.target.value })}
+                    placeholder="gpt-4o-mini"
+                  />
+                </label>
+
+                <label className="space-y-1.5 block">
+                  <span className="text-sm muted">Reply system prompt (optional, mentions replies)</span>
+                  <textarea
+                    className="field min-h-24"
+                    value={settingsForm.reply_system_prompt}
+                    onChange={(e) =>
+                      setSettingsForm({ ...settingsForm, reply_system_prompt: e.target.value })
+                    }
                   />
                 </label>
                 <label className="space-y-1.5 block">
-                  <span className="text-sm muted">Role</span>
-                  <select
-                    className="field"
-                    value={newUser.role}
+                  <span className="text-sm muted">Compose system prompt (optional, original and quote posts)</span>
+                  <textarea
+                    className="field min-h-24"
+                    value={settingsForm.compose_system_prompt}
                     onChange={(e) =>
-                      setNewUser({
-                        ...newUser,
-                        role: e.target.value as "admin" | "posting",
+                      setSettingsForm({ ...settingsForm, compose_system_prompt: e.target.value })
+                    }
+                  />
+                </label>
+              </div>
+            )}
+            {settingsTab === "feed" && (
+              <div className="space-y-6">
+                <label className="space-y-1.5 block">
+                  <span className="text-sm muted">Watched handles (one per line)</span>
+                  <textarea
+                    className="field min-h-28"
+                    value={handlesText}
+                    onChange={(e) => setHandlesText(e.target.value)}
+                    placeholder={"@elonmusk\n@openai"}
+                  />
+                </label>
+
+                <div className="space-y-4">
+                  <div>
+                    <h3 className="text-sm">
+                      Feed filters
+                    </h3>
+                    <p className="muted text-sm mt-1">
+                      Keep the feed tight so you are not paying X to surface low-signal posts.
+                      Keywords and engagement gates drop posts before they are stored. Topic
+                      search pushes phrase + engagement operators into the X recent-search
+                      query (one call), which is usually cheaper than watching many handles.
+                    </p>
+                  </div>
+
+                  <label className="space-y-1.5 block">
+                    <span className="text-sm muted">Topic keywords (one phrase per line)</span>
+                    <textarea
+                      className="field min-h-24"
+                      value={keywordsText}
+                      onChange={(e) => setKeywordsText(e.target.value)}
+                      placeholder={"AI agents\nopen source LLM"}
+                    />
+                  </label>
+
+                  <div className="flex flex-col gap-3">
+                    <label className="flex items-start gap-2.5 text-sm cursor-pointer">
+                      <input
+                        type="checkbox"
+                        className="mt-0.5"
+                        checked={settingsForm.keyword_exact_match}
+                        onChange={(e) =>
+                          setSettingsForm({
+                            ...settingsForm,
+                            keyword_exact_match: e.target.checked,
+                          })
+                        }
+                      />
+                      <span>
+                        Exact phrase match
+                        <span className="muted block text-xs mt-0.5">
+                          On: post must contain the full phrase. Off: every word in the phrase
+                          may appear in any order.
+                        </span>
+                      </span>
+                    </label>
+                    <label className="flex items-start gap-2.5 text-sm cursor-pointer">
+                      <input
+                        type="checkbox"
+                        className="mt-0.5"
+                        checked={settingsForm.enable_topic_search}
+                        onChange={(e) =>
+                          setSettingsForm({
+                            ...settingsForm,
+                            enable_topic_search: e.target.checked,
+                          })
+                        }
+                      />
+                      <span>
+                        Also search X for these topics
+                        <span className="muted block text-xs mt-0.5">
+                          Uses recent search with quoted phrases and min engagement operators.
+                          Requires keywords above. Works with or without watched handles.
+                          Results are for reading, quoting, or replying manually in X; X does
+                          not allow automated replies to search results.
+                        </span>
+                      </span>
+                    </label>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-3">
+                    <label className="space-y-1.5 block">
+                      <span className="text-sm muted">Min likes</span>
+                      <input
+                        className="field"
+                        type="number"
+                        min={0}
+                        value={settingsForm.min_like_count}
+                        onChange={(e) =>
+                          setSettingsForm({
+                            ...settingsForm,
+                            min_like_count: Math.max(0, Number(e.target.value) || 0),
+                          })
+                        }
+                      />
+                    </label>
+                    <label className="space-y-1.5 block">
+                      <span className="text-sm muted">Min replies</span>
+                      <input
+                        className="field"
+                        type="number"
+                        min={0}
+                        value={settingsForm.min_reply_count}
+                        onChange={(e) =>
+                          setSettingsForm({
+                            ...settingsForm,
+                            min_reply_count: Math.max(0, Number(e.target.value) || 0),
+                          })
+                        }
+                      />
+                    </label>
+                    <label className="space-y-1.5 block">
+                      <span className="text-sm muted">Min reposts</span>
+                      <input
+                        className="field"
+                        type="number"
+                        min={0}
+                        value={settingsForm.min_repost_count}
+                        onChange={(e) =>
+                          setSettingsForm({
+                            ...settingsForm,
+                            min_repost_count: Math.max(0, Number(e.target.value) || 0),
+                          })
+                        }
+                      />
+                    </label>
+                  </div>
+                </div>
+              </div>
+            )}
+            {settingsTab === "mentions" && (
+              <div className="space-y-6">
+                <p className="muted text-sm">
+                  Mentions are the only posts X lets this app reply to through the API.
+                </p>
+                <div className="flex flex-col gap-3">
+                <label className="flex items-start gap-2.5 text-sm cursor-pointer">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={settingsForm.enable_mentions}
+                    onChange={(e) =>
+                      setSettingsForm({
+                        ...settingsForm,
+                        enable_mentions: e.target.checked,
                       })
                     }
-                  >
-                    <option value="posting">posting</option>
-                    <option value="admin">admin</option>
-                  </select>
+                  />
+                  <span>
+                    Mentions inbox
+                    <span className="muted block text-xs mt-0.5">
+                      Fetches new posts that @mention you on each refresh and cron run. Billed
+                      as owned reads (about $0.001 each); only new mentions are fetched.
+                    </span>
+                  </span>
                 </label>
+                <label className="space-y-1.5 block max-w-48">
+                  <span className="text-sm muted">Max mentions per fetch</span>
+                  <input
+                    className="field"
+                    type="number"
+                    min={5}
+                    max={100}
+                    value={settingsForm.mentions_max_results}
+                    onChange={(e) =>
+                      setSettingsForm({
+                        ...settingsForm,
+                        mentions_max_results: Math.min(100, Math.max(5, Number(e.target.value) || 5)),
+                      })
+                    }
+                  />
+                </label>
+                </div>
+              </div>
+            )}
+            {settingsTab === "users" && (
+              <div className="space-y-6">
+                <div className="space-y-4">
+                  <div>
+                    <h3 className="text-sm">
+                      Users
+                    </h3>
+                    <p className="muted text-sm mt-1">
+                      Admin-only. Create posting users who can use Compose / Mentions / Feed / Queue on the
+                      shared X workspace. They cannot change settings or manage users.
+                    </p>
+                  </div>
+
+                  <div className="grid md:grid-cols-[1.2fr_1fr_auto_auto] gap-3 items-end">
+                    <label className="space-y-1.5 block">
+                      <span className="text-sm muted">Email</span>
+                      <input
+                        className="field"
+                        type="email"
+                        value={newUser.email}
+                        onChange={(e) => setNewUser({ ...newUser, email: e.target.value })}
+                        placeholder="teammate@example.com"
+                      />
+                    </label>
+                    <label className="space-y-1.5 block">
+                      <span className="text-sm muted">Password</span>
+                      <input
+                        className="field"
+                        type="password"
+                        value={newUser.password}
+                        onChange={(e) => setNewUser({ ...newUser, password: e.target.value })}
+                        placeholder="8+ characters"
+                      />
+                    </label>
+                    <label className="space-y-1.5 block">
+                      <span className="text-sm muted">Role</span>
+                      <select
+                        className="field"
+                        value={newUser.role}
+                        onChange={(e) =>
+                          setNewUser({
+                            ...newUser,
+                            role: e.target.value as "admin" | "posting",
+                          })
+                        }
+                      >
+                        <option value="posting">posting</option>
+                        <option value="admin">admin</option>
+                      </select>
+                    </label>
+                    <button
+                      className="btn btn-ghost"
+                      type="button"
+                      onClick={createAppUser}
+                      disabled={busy === "create-user" || !newUser.email || newUser.password.length < 8}
+                    >
+                      {busy === "create-user" ? "Creating…" : "Add user"}
+                    </button>
+                  </div>
+
+                  <div className="space-y-2">
+                    {users.length === 0 ? (
+                      <p className="muted text-sm">No users loaded.</p>
+                    ) : (
+                      users.map((u) => (
+                        <div
+                          key={u.id}
+                          className="flex flex-wrap items-center justify-between gap-3 py-2 border-b"
+                          style={{ borderColor: "var(--border)" }}
+                        >
+                          <div>
+                            <p className="text-sm">{u.email}</p>
+                            <p className="muted text-xs">
+                              {u.role}
+                              {u.active ? "" : " · inactive"}
+                              {u.id === sessionUser?.id ? " · you" : ""}
+                            </p>
+                          </div>
+                          <div className="flex gap-2">
+                            <button
+                              className="btn btn-ghost text-sm"
+                              type="button"
+                              disabled={busy === `user-${u.id}`}
+                              onClick={() =>
+                                patchAppUser(u.id, {
+                                  role: u.role === "admin" ? "posting" : "admin",
+                                })
+                              }
+                            >
+                              Make {u.role === "admin" ? "posting" : "admin"}
+                            </button>
+                            <button
+                              className="btn btn-ghost text-sm"
+                              type="button"
+                              disabled={busy === `user-${u.id}`}
+                              onClick={() => patchAppUser(u.id, { active: !u.active })}
+                            >
+                              {u.active ? "Deactivate" : "Activate"}
+                            </button>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {settingsTab !== "users" ? (
+              <div className="flex flex-wrap gap-2">
                 <button
-                  className="btn btn-ghost"
+                  className="btn btn-primary"
                   type="button"
-                  onClick={createAppUser}
-                  disabled={busy === "create-user" || !newUser.email || newUser.password.length < 8}
+                  onClick={saveSettings}
+                  disabled={busy === "settings"}
                 >
-                  {busy === "create-user" ? "Creating…" : "Add user"}
+                  {busy === "settings" ? "Saving…" : "Save settings"}
                 </button>
               </div>
-
-              <div className="space-y-2">
-                {users.length === 0 ? (
-                  <p className="muted text-sm">No users loaded.</p>
-                ) : (
-                  users.map((u) => (
-                    <div
-                      key={u.id}
-                      className="flex flex-wrap items-center justify-between gap-3 py-2 border-b"
-                      style={{ borderColor: "var(--border)" }}
-                    >
-                      <div>
-                        <p className="text-sm">{u.email}</p>
-                        <p className="muted text-xs">
-                          {u.role}
-                          {u.active ? "" : " · inactive"}
-                          {u.id === sessionUser?.id ? " · you" : ""}
-                        </p>
-                      </div>
-                      <div className="flex gap-2">
-                        <button
-                          className="btn btn-ghost text-sm"
-                          type="button"
-                          disabled={busy === `user-${u.id}`}
-                          onClick={() =>
-                            patchAppUser(u.id, {
-                              role: u.role === "admin" ? "posting" : "admin",
-                            })
-                          }
-                        >
-                          Make {u.role === "admin" ? "posting" : "admin"}
-                        </button>
-                        <button
-                          className="btn btn-ghost text-sm"
-                          type="button"
-                          disabled={busy === `user-${u.id}`}
-                          onClick={() => patchAppUser(u.id, { active: !u.active })}
-                        >
-                          {u.active ? "Deactivate" : "Activate"}
-                        </button>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-
-            <div className="flex flex-wrap gap-2">
-              <button
-                className="btn btn-primary"
-                type="button"
-                onClick={saveSettings}
-                disabled={busy === "settings"}
-              >
-                {busy === "settings" ? "Saving…" : "Save settings"}
-              </button>
-              <button
-                className="btn btn-ghost"
-                type="button"
-                onClick={connectX}
-                disabled={!settings.has_x_client_id || !settings.has_x_client_secret}
-              >
-                Connect with X
-              </button>
-              <button
-                className="btn btn-ghost"
-                type="button"
-                onClick={testX}
-                disabled={busy === "test-x"}
-              >
-                {busy === "test-x" ? "Testing…" : "Test X auth"}
-              </button>
-            </div>
+            ) : null}
           </section>
         )}
       </div>
@@ -1136,17 +1403,235 @@ export default function HomePage() {
   );
 }
 
+function dayLabel(iso: string) {
+  const d = new Date(iso);
+  // Past due but not posted yet (cron hasn't run, or it failed to claim it).
+  if (d.getTime() < Date.now()) return "Overdue";
+  const startOf = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const diffDays = Math.round((startOf(d) - startOf(new Date())) / 86_400_000);
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Tomorrow";
+  return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+}
+
+/** Compose tab sidebar: what's already scheduled (soonest first) and recent drafts. */
+function SchedulePanel(props: {
+  drafts: Draft[];
+  busy: string | null;
+  onAction: (id: string, action: "post" | "delete") => void;
+  onViewQueue: () => void;
+}) {
+  const scheduled = props.drafts
+    .filter((d) => d.status === "scheduled" && d.scheduled_at)
+    .sort((a, b) => Date.parse(a.scheduled_at!) - Date.parse(b.scheduled_at!));
+  const recentDrafts = props.drafts
+    .filter((d) => d.status === "draft")
+    .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at))
+    .slice(0, 5);
+
+  const groups: { label: string; items: Draft[] }[] = [];
+  for (const d of scheduled) {
+    const label = dayLabel(d.scheduled_at!);
+    const last = groups[groups.length - 1];
+    if (last?.label === label) last.items.push(d);
+    else groups.push({ label, items: [d] });
+  }
+
+  const typeLabel = (d: Draft) =>
+    d.type === "reply"
+      ? `Reply to @${d.reply_to_handle}`
+      : d.type === "quote"
+        ? `Quote of @${d.reply_to_handle}`
+        : "Post";
+
+  const row = (d: Draft, when: string) => (
+    <div key={d.id} className="rounded-xl border p-3" style={{ borderColor: "var(--border)" }}>
+      <div className="flex items-baseline justify-between gap-2 mb-1.5 text-xs">
+        <span style={{ fontFamily: "var(--font-ibm), monospace" }}>{when}</span>
+        <span className="muted">
+          {typeLabel(d)}
+          {d.media_paths.length ? ` · ${d.media_paths.length} media` : ""}
+        </span>
+      </div>
+      <p className="text-sm whitespace-pre-wrap line-clamp-3 mb-2.5">{d.content}</p>
+      <div className="flex gap-2">
+        <button
+          className="btn btn-ghost"
+          type="button"
+          style={{ padding: "0.25rem 0.7rem" }}
+          disabled={props.busy === `draft-${d.id}`}
+          onClick={() => props.onAction(d.id, "post")}
+        >
+          Post now
+        </button>
+        <button
+          className="btn btn-danger"
+          type="button"
+          style={{ padding: "0.25rem 0.7rem" }}
+          disabled={props.busy === `draft-${d.id}`}
+          onClick={() => props.onAction(d.id, "delete")}
+        >
+          Delete
+        </button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="panel p-4 md:p-5 space-y-5">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <h2 className="text-lg">
+            Scheduled
+          </h2>
+          <p className="muted text-sm">
+            {scheduled.length
+              ? `${scheduled.length} post${scheduled.length === 1 ? "" : "s"} queued`
+              : "Nothing scheduled yet"}
+          </p>
+        </div>
+        <button className="btn btn-ghost" type="button" onClick={props.onViewQueue}>
+          View queue
+        </button>
+      </div>
+
+      {groups.length === 0 ? (
+        <p className="muted text-sm py-6 text-center">
+          Pick a time and hit Schedule. Upcoming posts will show here.
+        </p>
+      ) : (
+        <div className="space-y-4 max-h-[60vh] overflow-auto pr-1">
+          {groups.map((g) => (
+            <div key={g.label} className="space-y-2">
+              <p
+                className="text-xs uppercase tracking-wide"
+                style={{ color: g.label === "Overdue" ? "var(--danger)" : "var(--muted)" }}
+              >
+                {g.label}
+              </p>
+              {g.items.map((d) =>
+                row(
+                  d,
+                  new Date(d.scheduled_at!).toLocaleTimeString(undefined, {
+                    hour: "numeric",
+                    minute: "2-digit",
+                  }),
+                ),
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {recentDrafts.length ? (
+        <div className="space-y-2 pt-1">
+          <p className="text-xs uppercase tracking-wide muted">Recent drafts</p>
+          {recentDrafts.map((d) => row(d, formatWhen(d.updated_at)))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ProfileMenu(props: {
+  user: SessionUser | null;
+  handle: string;
+  settingsActive: boolean;
+  /** null for non-admins, who can't open Settings. */
+  onSettings: (() => void) | null;
+  onSignOut: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  // Close on outside click or Escape.
+  useEffect(() => {
+    if (!open) return;
+    function onPointer(e: PointerEvent) {
+      if (!ref.current?.contains(e.target as Node)) setOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("pointerdown", onPointer);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onPointer);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  const itemClass = "w-full text-left px-4 py-2.5 text-sm hover:bg-[var(--bg-soft)]";
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        type="button"
+        aria-label="Profile menu"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        className="block rounded-full overflow-hidden border-2"
+        style={{ borderColor: open || props.settingsActive ? "var(--accent)" : "var(--border-strong)" }}
+      >
+        <Image src="/avatar.jpg" alt="Profile" width={44} height={44} priority />
+      </button>
+
+      {open ? (
+        <div
+          role="menu"
+          className="absolute right-0 mt-2 w-64 rounded-xl border overflow-hidden z-20 shadow-2xl"
+          style={{ background: "var(--bg-elevated)", borderColor: "var(--border-strong)" }}
+        >
+          <div className="px-4 py-3 border-b" style={{ borderColor: "var(--border)" }}>
+            <p className="text-sm truncate">{props.user?.email ?? "Signed in"}</p>
+            <p className="muted text-xs mt-0.5">
+              {props.user?.role ?? ""}
+              {props.handle ? (
+                <>
+                  {" · "}
+                  <span style={{ fontFamily: "var(--font-ibm), monospace" }}>@{props.handle}</span>
+                </>
+              ) : null}
+            </p>
+          </div>
+          {props.onSettings ? (
+            <button
+              type="button"
+              role="menuitem"
+              className={itemClass}
+              onClick={() => {
+                setOpen(false);
+                props.onSettings?.();
+              }}
+            >
+              Settings
+            </button>
+          ) : null}
+          <button
+            type="button"
+            role="menuitem"
+            className={itemClass}
+            style={{ color: "var(--danger)" }}
+            onClick={props.onSignOut}
+          >
+            Sign out
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function Composer(props: {
-  mode: "reply" | "original";
-  setMode: (m: "reply" | "original") => void;
-  selected: FeedPost | null;
+  mode: ComposerMode;
+  setMode: (m: ComposerMode) => void;
+  target: Target | null;
   forceOriginal?: boolean;
   content: string;
   setContent: (v: string) => void;
-  instruction: string;
-  setInstruction: (v: string) => void;
-  originalPrompt: string;
-  setOriginalPrompt: (v: string) => void;
+  notes: string;
+  setNotes: (v: string) => void;
   mediaPaths: string[];
   setMediaPaths: (v: string[] | ((p: string[]) => string[])) => void;
   scheduleAt: string;
@@ -1157,85 +1642,90 @@ function Composer(props: {
   onGenerate: () => void;
   onUpload: (file: File) => void;
   onAct: (action: "draft" | "schedule" | "post") => void;
+  onOpenInX: () => void;
 }) {
   useEffect(() => {
     if (props.forceOriginal) props.setMode("original");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.forceOriginal]);
 
+  // X only accepts API replies to posts that mention us; other replies go through X's own UI.
+  const replyInX = props.mode === "reply" && props.target?.source !== "mention";
+  const hasLink = containsLink(props.content);
+
   return (
     <div className="panel p-4 md:p-5 space-y-4">
       <div className="flex items-center justify-between gap-3">
-        <h2 className="text-lg" style={{ fontFamily: "var(--font-syne), sans-serif" }}>
-          {props.forceOriginal ? "New post" : "Compose"}
+        <h2 className="text-lg">
+          {props.forceOriginal ? "New post" : "Respond"}
         </h2>
         {!props.forceOriginal ? (
           <div className="flex gap-1">
-            <button
-              type="button"
-              className="btn"
-              onClick={() => props.setMode("reply")}
-              style={
-                props.mode === "reply"
-                  ? { background: "var(--accent)", color: "var(--accent-ink)", padding: "0.35rem 0.8rem" }
-                  : { border: "1px solid var(--border-strong)", padding: "0.35rem 0.8rem" }
-              }
-            >
-              Reply
-            </button>
-            <button
-              type="button"
-              className="btn"
-              onClick={() => props.setMode("original")}
-              style={
-                props.mode === "original"
-                  ? { background: "var(--accent)", color: "var(--accent-ink)", padding: "0.35rem 0.8rem" }
-                  : { border: "1px solid var(--border-strong)", padding: "0.35rem 0.8rem" }
-              }
-            >
-              Original
-            </button>
+            {(
+              [
+                ["reply", "Reply"],
+                ["quote", "Quote"],
+              ] as const
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                className="btn"
+                onClick={() => props.setMode(id)}
+                style={
+                  props.mode === id
+                    ? { background: "var(--accent)", color: "var(--accent-ink)", padding: "0.35rem 0.8rem" }
+                    : { border: "1px solid var(--border-strong)", padding: "0.35rem 0.8rem" }
+                }
+              >
+                {label}
+              </button>
+            ))}
           </div>
         ) : null}
       </div>
 
-      {props.mode === "reply" ? (
+      {!props.forceOriginal ? (
         <div
           className="rounded-xl border p-3 text-sm"
           style={{ borderColor: "var(--border)", background: "var(--bg-soft)" }}
         >
-          {props.selected ? (
+          {props.target ? (
             <>
-              <p className="muted text-xs mb-1">Replying to @{props.selected.author_handle}</p>
-              <p className="whitespace-pre-wrap line-clamp-4">{props.selected.content}</p>
+              <p className="muted text-xs mb-1">
+                {props.mode === "quote" ? "Quoting" : "Replying to"} @{props.target.author_handle}
+              </p>
+              <p className="whitespace-pre-wrap line-clamp-4">{props.target.content}</p>
             </>
           ) : (
-            <p className="muted">Select a post from the feed.</p>
+            <p className="muted">Select a post from the list.</p>
           )}
         </div>
       ) : null}
 
-      {props.mode === "reply" ? (
-        <label className="block space-y-1.5">
-          <span className="text-sm muted">Instruction for the model</span>
-          <input
-            className="field"
-            value={props.instruction}
-            onChange={(e) => props.setInstruction(e.target.value)}
-            placeholder="Keep it witty, ask a follow-up…"
-          />
-        </label>
-      ) : (
-        <label className="block space-y-1.5">
-          <span className="text-sm muted">Prompt</span>
-          <textarea
-            className="field min-h-24"
-            value={props.originalPrompt}
-            onChange={(e) => props.setOriginalPrompt(e.target.value)}
-            placeholder="What should this post be about?"
-          />
-        </label>
-      )}
+      {replyInX ? (
+        <p className="text-xs muted">
+          X only lets apps reply to posts that mention you, so this reply opens in X for you
+          to post. Mentions can be replied to from the Mentions tab.
+        </p>
+      ) : null}
+
+      <label className="block space-y-1.5">
+        <span className="text-sm muted">Your notes for the AI</span>
+        <textarea
+          className="field min-h-24"
+          value={props.notes}
+          onChange={(e) => props.setNotes(e.target.value)}
+          placeholder={
+            props.mode === "original"
+              ? "What should this post be about?"
+              : "The point you want to make…"
+          }
+        />
+        <span className="text-xs muted block">
+          Only your notes are sent to the AI, never the post itself.
+        </span>
+      </label>
 
       <div className="flex gap-2">
         <button
@@ -1259,84 +1749,104 @@ function Composer(props: {
           onChange={(e) => props.setContent(e.target.value)}
           placeholder="Your reply or post…"
         />
+        {hasLink && !replyInX ? (
+          <span className="text-xs char-warn block">
+            Contains a link: X bills posts with links at $0.20 instead of $0.015.
+          </span>
+        ) : null}
       </label>
 
-      <div className="space-y-2">
-        <div className="flex items-center justify-between">
-          <span className="text-sm muted">Media</span>
-          <label className="btn btn-ghost" style={{ padding: "0.35rem 0.8rem" }}>
-            Attach
+      {replyInX ? (
+        <div className="flex flex-wrap gap-2 pt-1">
+          <button
+            className="btn btn-primary"
+            type="button"
+            disabled={!props.target || !props.content.trim()}
+            onClick={props.onOpenInX}
+          >
+            Open in X
+          </button>
+        </div>
+      ) : (
+        <>
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-sm muted">Media</span>
+              <label className="btn btn-ghost" style={{ padding: "0.35rem 0.8rem" }}>
+                Attach
+                <input
+                  type="file"
+                  className="hidden"
+                  accept="image/jpeg,image/png,image/webp,image/gif,video/mp4"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) props.onUpload(file);
+                    e.target.value = "";
+                  }}
+                />
+              </label>
+            </div>
+            {props.mediaPaths.length > 0 ? (
+              <ul className="space-y-1">
+                {props.mediaPaths.map((p) => (
+                  <li key={p} className="flex items-center justify-between text-xs muted gap-2">
+                    <span className="truncate" style={{ fontFamily: "var(--font-ibm), monospace" }}>
+                      {p}
+                    </span>
+                    <button
+                      type="button"
+                      className="btn btn-danger"
+                      style={{ padding: "0.2rem 0.6rem" }}
+                      onClick={() => props.setMediaPaths((prev) => prev.filter((x) => x !== p))}
+                    >
+                      Remove
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-xs muted">Optional image or video attachment.</p>
+            )}
+          </div>
+
+          <label className="block space-y-1.5">
+            <span className="text-sm muted">Schedule for</span>
             <input
-              type="file"
-              className="hidden"
-              accept="image/jpeg,image/png,image/webp,image/gif,video/mp4"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (file) props.onUpload(file);
-                e.target.value = "";
-              }}
+              className="field"
+              type="datetime-local"
+              value={props.scheduleAt}
+              onChange={(e) => props.setScheduleAt(e.target.value)}
             />
           </label>
-        </div>
-        {props.mediaPaths.length > 0 ? (
-          <ul className="space-y-1">
-            {props.mediaPaths.map((p) => (
-              <li key={p} className="flex items-center justify-between text-xs muted gap-2">
-                <span className="truncate" style={{ fontFamily: "var(--font-ibm), monospace" }}>
-                  {p}
-                </span>
-                <button
-                  type="button"
-                  className="btn btn-danger"
-                  style={{ padding: "0.2rem 0.6rem" }}
-                  onClick={() => props.setMediaPaths((prev) => prev.filter((x) => x !== p))}
-                >
-                  Remove
-                </button>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="text-xs muted">Optional image or video attachment.</p>
-        )}
-      </div>
 
-      <label className="block space-y-1.5">
-        <span className="text-sm muted">Schedule for</span>
-        <input
-          className="field"
-          type="datetime-local"
-          value={props.scheduleAt}
-          onChange={(e) => props.setScheduleAt(e.target.value)}
-        />
-      </label>
-
-      <div className="flex flex-wrap gap-2 pt-1">
-        <button
-          className="btn btn-primary"
-          type="button"
-          disabled={Boolean(props.busy)}
-          onClick={() => props.onAct("post")}
-        >
-          Post now
-        </button>
-        <button
-          className="btn btn-ghost"
-          type="button"
-          disabled={Boolean(props.busy)}
-          onClick={() => props.onAct("schedule")}
-        >
-          Schedule
-        </button>
-        <button
-          className="btn btn-ghost"
-          type="button"
-          disabled={Boolean(props.busy)}
-          onClick={() => props.onAct("draft")}
-        >
-          Save draft
-        </button>
-      </div>
+          <div className="flex flex-wrap gap-2 pt-1">
+            <button
+              className="btn btn-primary"
+              type="button"
+              disabled={Boolean(props.busy)}
+              onClick={() => props.onAct("post")}
+            >
+              Post now
+            </button>
+            <button
+              className="btn btn-ghost"
+              type="button"
+              disabled={Boolean(props.busy)}
+              onClick={() => props.onAct("schedule")}
+            >
+              Schedule
+            </button>
+            <button
+              className="btn btn-ghost"
+              type="button"
+              disabled={Boolean(props.busy)}
+              onClick={() => props.onAct("draft")}
+            >
+              Save draft
+            </button>
+          </div>
+        </>
+      )}
     </div>
   );
 }

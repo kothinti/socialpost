@@ -1,4 +1,10 @@
-import { MongoClient, ObjectId, type Collection, type Db } from "mongodb";
+import {
+  GridFSBucket,
+  MongoClient,
+  ObjectId,
+  type Collection,
+  type Db,
+} from "mongodb";
 import fs from "fs";
 import path from "path";
 
@@ -48,6 +54,8 @@ export type Settings = {
   x_oauth_expires_at: string;
   x_redirect_uri: string;
   x_connected_handle: string;
+  /** X user id of the connected account; needed for the mentions timeline. */
+  x_connected_user_id: string;
   openai_api_key: string;
   openai_model: string;
   watched_handles: string[];
@@ -60,6 +68,10 @@ export type Settings = {
   min_reply_count: number;
   min_repost_count: number;
   enable_topic_search: boolean;
+  enable_mentions: boolean;
+  mentions_max_results: number;
+  /** Newest mention id already fetched, so each fetch only pays for new mentions. */
+  mentions_since_id: string;
   updated_at: string;
 };
 
@@ -98,15 +110,20 @@ type FetchedPostDoc = {
   fetched_at: Date;
 };
 
+export type DraftStatus = "draft" | "scheduled" | "posting" | "posted" | "failed";
+
+export type DraftType = "reply" | "quote" | "original";
+
 export type Draft = {
   id: string;
-  type: "reply" | "original";
+  type: DraftType;
+  /** Target post: the post replied to (type "reply") or quoted (type "quote"). */
   reply_to_x_id: string | null;
   reply_to_handle: string | null;
   reply_to_content: string | null;
   content: string;
   media_paths: string[];
-  status: "draft" | "scheduled" | "posted" | "failed";
+  status: DraftStatus;
   scheduled_at: string | null;
   posted_at: string | null;
   x_post_id: string | null;
@@ -118,13 +135,13 @@ export type Draft = {
 
 type DraftDoc = {
   _id: ObjectId;
-  type: "reply" | "original";
+  type: DraftType;
   reply_to_x_id: string | null;
   reply_to_handle: string | null;
   reply_to_content: string | null;
   content: string;
   media_paths: string[];
-  status: "draft" | "scheduled" | "posted" | "failed";
+  status: DraftStatus;
   scheduled_at: Date | null;
   posted_at: Date | null;
   x_post_id: string | null;
@@ -132,6 +149,27 @@ type DraftDoc = {
   created_by_user_id: ObjectId | null;
   created_at: Date;
   updated_at: Date;
+};
+
+export type Mention = {
+  id: string;
+  x_post_id: string;
+  author_handle: string;
+  author_name: string | null;
+  content: string;
+  posted_at: string | null;
+  replied_x_post_id: string | null;
+};
+
+type MentionDoc = {
+  _id: ObjectId;
+  x_post_id: string;
+  author_handle: string;
+  author_name: string | null;
+  content: string;
+  posted_at: Date | null;
+  fetched_at: Date;
+  replied_x_post_id: string | null;
 };
 
 type JobRunDoc = {
@@ -151,6 +189,7 @@ const DEFAULT_SETTINGS: Omit<SettingsDoc, "_id" | "updated_at"> = {
   x_oauth_expires_at: "",
   x_redirect_uri: "",
   x_connected_handle: "",
+  x_connected_user_id: "",
   openai_api_key: "",
   openai_model: "gpt-4o-mini",
   watched_handles: [],
@@ -163,6 +202,9 @@ const DEFAULT_SETTINGS: Omit<SettingsDoc, "_id" | "updated_at"> = {
   min_reply_count: 0,
   min_repost_count: 0,
   enable_topic_search: false,
+  enable_mentions: true,
+  mentions_max_results: 20,
+  mentions_since_id: "",
 };
 
 const globalForMongo = globalThis as unknown as {
@@ -194,8 +236,8 @@ function formatMongoError(err: unknown): string {
   if (/server selection timed out|timed out|Timeout/i.test(msg)) {
     return "MongoDB connection timed out. Allow Vercel IPs in Atlas Network Access (0.0.0.0/0), then redeploy.";
   }
-  if (/SSL|TLS|certificate/i.test(msg)) {
-    return `MongoDB TLS error: ${msg}`;
+  if (/SSL|TLS|certificate|alert number 80|TLSV1_ALERT/i.test(msg)) {
+    return "MongoDB blocked the TLS handshake (usually Atlas Network Access). In Atlas → Network Access, add 0.0.0.0/0 (Allow from anywhere), wait ~1 minute, then retry. Vercel IPs are dynamic so a single IP whitelist will keep failing.";
   }
   return `MongoDB error: ${msg}`;
 }
@@ -246,6 +288,8 @@ async function ensureIndexes(db: Db) {
   await db.collection("fetched_posts").createIndex({ posted_at: -1 });
   await db.collection("drafts").createIndex({ status: 1, scheduled_at: 1 });
   await db.collection("job_runs").createIndex({ ran_at: -1 });
+  await db.collection("mentions").createIndex({ x_post_id: 1 }, { unique: true });
+  await db.collection("mentions").createIndex({ posted_at: -1 });
 
   const settings = db.collection<SettingsDoc>("settings");
   const existing = await settings.findOne({ _id: SETTINGS_ID });
@@ -274,6 +318,10 @@ function draftsCol(db: Db): Collection<DraftDoc> {
   return db.collection<DraftDoc>("drafts");
 }
 
+function mentionsCol(db: Db): Collection<MentionDoc> {
+  return db.collection<MentionDoc>("mentions");
+}
+
 function jobsCol(db: Db): Collection<JobRunDoc> {
   return db.collection<JobRunDoc>("job_runs");
 }
@@ -300,6 +348,7 @@ function mapSettings(doc: SettingsDoc): Settings {
     x_oauth_expires_at: doc.x_oauth_expires_at ?? "",
     x_redirect_uri: doc.x_redirect_uri ?? "",
     x_connected_handle: doc.x_connected_handle ?? "",
+    x_connected_user_id: doc.x_connected_user_id ?? "",
     openai_api_key: doc.openai_api_key ?? "",
     openai_model: doc.openai_model || "gpt-4o-mini",
     watched_handles: Array.isArray(doc.watched_handles) ? doc.watched_handles : [],
@@ -312,6 +361,10 @@ function mapSettings(doc: SettingsDoc): Settings {
     min_reply_count: Number(doc.min_reply_count) || 0,
     min_repost_count: Number(doc.min_repost_count) || 0,
     enable_topic_search: Boolean(doc.enable_topic_search),
+    enable_mentions: doc.enable_mentions ?? DEFAULT_SETTINGS.enable_mentions,
+    mentions_max_results:
+      Number(doc.mentions_max_results) || DEFAULT_SETTINGS.mentions_max_results,
+    mentions_since_id: doc.mentions_since_id ?? "",
     updated_at: toIso(doc.updated_at) ?? new Date().toISOString(),
   };
 }
@@ -352,6 +405,18 @@ function mapDraft(doc: DraftDoc): Draft {
       : null,
     created_at: toIso(doc.created_at) ?? new Date().toISOString(),
     updated_at: toIso(doc.updated_at) ?? new Date().toISOString(),
+  };
+}
+
+function mapMention(doc: MentionDoc): Mention {
+  return {
+    id: doc._id.toHexString(),
+    x_post_id: doc.x_post_id,
+    author_handle: doc.author_handle,
+    author_name: doc.author_name,
+    content: doc.content,
+    posted_at: toIso(doc.posted_at),
+    replied_x_post_id: doc.replied_x_post_id ?? null,
   };
 }
 
@@ -397,6 +462,7 @@ export async function saveOAuthTokens(opts: {
   refreshToken?: string | null;
   expiresIn?: number | null;
   handle?: string | null;
+  userId?: string | null;
 }) {
   const expiresAt =
     opts.expiresIn && opts.expiresIn > 0
@@ -409,6 +475,14 @@ export async function saveOAuthTokens(opts: {
   };
   if (opts.refreshToken) patch.x_access_secret = opts.refreshToken;
   if (opts.handle) patch.x_connected_handle = opts.handle;
+  if (opts.userId) {
+    const current = await getSettings();
+    if (current.x_connected_user_id !== opts.userId) {
+      // Different account: its mentions cursor doesn't apply.
+      patch.x_connected_user_id = opts.userId;
+      patch.mentions_since_id = "";
+    }
+  }
 
   await updateSettings(patch);
 
@@ -552,6 +626,7 @@ export async function listDrafts(): Promise<Draft[]> {
   const db = await getMongo();
   const docs = await draftsCol(db).find({}).toArray();
   const statusOrder: Record<string, number> = {
+    posting: 0,
     scheduled: 0,
     draft: 1,
     failed: 2,
@@ -576,7 +651,7 @@ export async function findDraftById(id: string): Promise<Draft | null> {
 }
 
 export async function createDraft(input: {
-  type: "reply" | "original";
+  type: DraftType;
   content: string;
   reply_to_x_id?: string | null;
   reply_to_handle?: string | null;
@@ -623,6 +698,8 @@ export async function updateDraft(
     x_post_id: string | null;
     error: string | null;
   }>,
+  /** Only apply the patch if the draft is still in one of these statuses. */
+  onlyIfStatus?: DraftStatus[],
 ): Promise<Draft | null> {
   if (!ObjectId.isValid(id)) return null;
   const db = await getMongo();
@@ -637,8 +714,11 @@ export async function updateDraft(
   if (patch.x_post_id !== undefined) $set.x_post_id = patch.x_post_id;
   if (patch.error !== undefined) $set.error = patch.error;
 
+  const filter: Record<string, unknown> = { _id: new ObjectId(id) };
+  if (onlyIfStatus) filter.status = { $in: onlyIfStatus };
+
   const result = await draftsCol(db).findOneAndUpdate(
-    { _id: new ObjectId(id) },
+    filter,
     { $set },
     { returnDocument: "after" },
   );
@@ -652,6 +732,31 @@ export async function deleteDraft(id: string): Promise<boolean> {
   return result.deletedCount > 0;
 }
 
+/**
+ * Atomically move a draft into "posting" so only one caller (cron or a manual
+ * "Post now") can publish it. Returns null if another caller already claimed it
+ * or it is no longer in one of `fromStatuses`.
+ */
+export async function claimDraftForPosting(
+  id: string,
+  fromStatuses: DraftStatus[],
+  opts: { dueBy?: Date } = {},
+): Promise<Draft | null> {
+  if (!ObjectId.isValid(id)) return null;
+  const db = await getMongo();
+  const filter: Record<string, unknown> = {
+    _id: new ObjectId(id),
+    status: { $in: fromStatuses },
+  };
+  if (opts.dueBy) filter.scheduled_at = { $ne: null, $lte: opts.dueBy };
+  const result = await draftsCol(db).findOneAndUpdate(
+    filter,
+    { $set: { status: "posting", error: null, updated_at: new Date() } },
+    { returnDocument: "after" },
+  );
+  return result ? mapDraft(result) : null;
+}
+
 export async function listDueDrafts(): Promise<Draft[]> {
   const db = await getMongo();
   const now = new Date();
@@ -663,6 +768,98 @@ export async function listDueDrafts(): Promise<Draft[]> {
     .sort({ scheduled_at: 1 })
     .toArray();
   return docs.map(mapDraft);
+}
+
+export async function upsertMention(row: {
+  x_post_id: string;
+  author_handle: string;
+  author_name: string | null;
+  content: string;
+  posted_at: string | null;
+}): Promise<void> {
+  const db = await getMongo();
+  await mentionsCol(db).updateOne(
+    { x_post_id: row.x_post_id },
+    {
+      $set: {
+        author_handle: row.author_handle,
+        author_name: row.author_name,
+        content: row.content,
+        posted_at: parseDate(row.posted_at),
+        fetched_at: new Date(),
+      },
+      $setOnInsert: { x_post_id: row.x_post_id, replied_x_post_id: null },
+    },
+    { upsert: true },
+  );
+}
+
+export async function listMentions(limit = 100): Promise<Mention[]> {
+  const db = await getMongo();
+  const docs = await mentionsCol(db)
+    .find({})
+    .sort({ posted_at: -1 })
+    .limit(limit)
+    .toArray();
+  return docs.map(mapMention);
+}
+
+/** A post we may reply to via the API: X only allows replies to posts that mention us. */
+export async function findMentionByXId(xPostId: string): Promise<Mention | null> {
+  const db = await getMongo();
+  const doc = await mentionsCol(db).findOne({ x_post_id: xPostId });
+  return doc ? mapMention(doc) : null;
+}
+
+export async function markMentionReplied(xPostId: string, replyXPostId: string) {
+  const db = await getMongo();
+  await mentionsCol(db).updateOne(
+    { x_post_id: xPostId },
+    { $set: { replied_x_post_id: replyXPostId } },
+  );
+}
+
+export async function deleteOldMentions(olderThanDays: number) {
+  const db = await getMongo();
+  const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000);
+  await mentionsCol(db).deleteMany({ posted_at: { $ne: null, $lt: cutoff } });
+}
+
+/**
+ * Uploaded media lives in GridFS so every serverless instance (and the cron
+ * run that publishes later) can read it; local disk / /tmp is per-instance.
+ */
+function mediaBucket(db: Db) {
+  return new GridFSBucket(db, { bucketName: "media" });
+}
+
+export async function saveMedia(
+  filename: string,
+  data: Buffer,
+  contentType: string,
+): Promise<void> {
+  const db = await getMongo();
+  await new Promise<void>((resolve, reject) => {
+    const upload = mediaBucket(db).openUploadStream(filename, {
+      metadata: { contentType },
+    });
+    upload.once("finish", () => resolve());
+    upload.once("error", reject);
+    upload.end(data);
+  });
+}
+
+/** Returns null if no media with this filename exists. */
+export async function readMedia(filename: string): Promise<Buffer | null> {
+  const db = await getMongo();
+  const bucket = mediaBucket(db);
+  const file = await bucket.find({ filename }).limit(1).next();
+  if (!file) return null;
+  const chunks: Buffer[] = [];
+  for await (const chunk of bucket.openDownloadStream(file._id)) {
+    chunks.push(chunk as Buffer);
+  }
+  return Buffer.concat(chunks);
 }
 
 export async function logJob(job: string, status: string, detail?: string) {

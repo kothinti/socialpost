@@ -1,15 +1,17 @@
 import type { Metadata } from "next";
-import { IBM_Plex_Mono, Outfit, Syne } from "next/font/google";
+import { IBM_Plex_Mono, Montserrat, Radley } from "next/font/google";
 import "./globals.css";
 
-const outfit = Outfit({
-  variable: "--font-outfit",
+// Monfort brand fonts (monfortcompanies.com): Montserrat for UI/headings, Radley for serif copy.
+const montserrat = Montserrat({
+  variable: "--font-montserrat",
   subsets: ["latin"],
 });
 
-const syne = Syne({
-  variable: "--font-syne",
+const radley = Radley({
+  variable: "--font-radley",
   subsets: ["latin"],
+  weight: "400",
 });
 
 const ibm = IBM_Plex_Mono({
@@ -19,8 +21,8 @@ const ibm = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "SocialPost",
-  description: "Reply, compose, and schedule posts for X",
+  title: "MonfortSocial",
+  description: "Write and schedule posts, quote what you're reading, and answer mentions on X",
 };
 
 export default function RootLayout({
@@ -31,7 +33,7 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${outfit.variable} ${syne.variable} ${ibm.variable} h-full antialiased`}
+      className={`${montserrat.variable} ${radley.variable} ${ibm.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col">{children}</body>
     </html>

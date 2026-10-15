@@ -7,10 +7,9 @@ import {
   type UserRole,
 } from "./db";
 
+import { getAuthSecret } from "./auth-secret";
+
 const COOKIE = "sp_session";
-const SECRET = new TextEncoder().encode(
-  process.env.AUTH_SECRET || "socialpost-dev-secret-change-me",
-);
 
 export type SessionUser = {
   id: string;
@@ -32,7 +31,7 @@ export async function createSession(user: SessionUser) {
     .setSubject(user.id)
     .setIssuedAt()
     .setExpirationTime("30d")
-    .sign(SECRET);
+    .sign(getAuthSecret());
 
   const jar = await cookies();
   jar.set(COOKIE, token, {
@@ -55,7 +54,7 @@ export async function getSession(): Promise<SessionUser | null> {
   if (!token) return null;
 
   try {
-    const { payload } = await jwtVerify(token, SECRET);
+    const { payload } = await jwtVerify(token, getAuthSecret());
     const id = String(payload.sub || "");
     const email = String(payload.email || "");
     if (!id || !email) return null;
