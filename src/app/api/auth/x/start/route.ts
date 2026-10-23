@@ -1,3 +1,5 @@
+import { accountId } from "@/lib/accounts";
+import { accountRoute } from "@/lib/accounts";
 import { NextRequest, NextResponse } from "next/server";
 import { requireAdmin } from "@/lib/auth";
 import { createOAuth2Link, defaultRedirectUri, formatXError } from "@/lib/x";
@@ -6,7 +8,7 @@ import { publicOrigin, publicUrl } from "@/lib/origin";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   const session = await requireAdmin();
   if (!session) {
     return NextResponse.redirect(publicUrl(req, "/login"));
@@ -19,7 +21,8 @@ export async function GET(req: NextRequest) {
 
     const res = NextResponse.redirect(url);
     const secure =
-      publicOrigin(req).startsWith("https:") || process.env.NODE_ENV === "production";
+      publicOrigin(req).startsWith("https:") ||
+      process.env.NODE_ENV === "production";
     const cookieOpts = {
       httpOnly: true,
       sameSite: "lax" as const,
@@ -29,10 +32,15 @@ export async function GET(req: NextRequest) {
     };
     res.cookies.set("x_oauth_verifier", codeVerifier, cookieOpts);
     res.cookies.set("x_oauth_state", state, cookieOpts);
+    res.cookies.set("x_oauth_account", accountId(), cookieOpts);
     res.cookies.set("x_oauth_redirect", redirectUri, cookieOpts);
     return res;
   } catch (err) {
     const message = encodeURIComponent(formatXError(err));
-    return NextResponse.redirect(publicUrl(req, `/?tab=settings&xerror=${message}`));
+    return NextResponse.redirect(
+      publicUrl(req, `/?tab=settings&xerror=${message}`),
+    );
   }
 }
+
+export const GET = accountRoute(handleGET);

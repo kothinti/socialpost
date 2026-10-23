@@ -1,3 +1,6 @@
+import { accountId, inAccount } from "./accounts";
+import { acquireAccountLease, releaseAccountLease } from "./db";
+import { validateXText } from "./x-text";
 import { ApiResponseError, TwitterApi, EUploadMimeType } from "twitter-api-v2";
 import fs from "fs";
 import path from "path";
@@ -16,10 +19,7 @@ import {
   type FetchedPost,
   type Settings,
 } from "./db";
-import {
-  buildTopicSearchQuery,
-  passesFeedFilters,
-} from "./feed-filters";
+import { buildTopicSearchQuery, passesFeedFilters } from "./feed-filters";
 import {
   feedFiltersFromSettings,
   getFeedFilterSettings,
@@ -46,6 +46,14 @@ export function formatXError(err: unknown): string {
         }
       }
     }
+    if (err.code === 429)
+      parts.push(
+        "Rate limit reached. Wait for the X rate-limit reset before retrying.",
+      );
+    if (err.code === 402)
+      parts.push(
+        "Check X API credits and endpoint access in the developer console.",
+      );
     if (err.code === 401 || err.code === 403) {
       parts.push(
         "Use OAuth 2.0: save Client ID + Client Secret, then click Connect with X. App-only Bearer Token cannot post.",
@@ -101,7 +109,7 @@ async function getReadClient() {
     return new TwitterApi(s.x_bearer_token.trim());
   }
   if (s.x_access_token) {
-    return new TwitterApi(s.x_access_token.trim());
+    return new TwitterApi(await ensureFreshUserToken());
   }
   throw new Error(
     "Add an X Bearer Token (for reading) or Connect with X in Settings.",
@@ -116,7 +124,9 @@ async function ensureFreshUserToken(): Promise<string> {
     );
   }
 
-  const expiresAt = s.x_oauth_expires_at ? Date.parse(s.x_oauth_expires_at) : NaN;
+  const expiresAt = s.x_oauth_expires_at
+    ? Date.parse(s.x_oauth_expires_at)
+    : NaN;
   const expiringSoon =
     Number.isFinite(expiresAt) && expiresAt - Date.now() < 2 * 60 * 1000;
 
@@ -128,14 +138,26 @@ async function ensureFreshUserToken(): Promise<string> {
     return s.x_access_token.trim();
   }
 
-  const app = await getOAuth2AppClient();
-  const refreshed = await app.refreshOAuth2Token(s.x_access_secret.trim());
-  await saveOAuthTokens({
-    accessToken: refreshed.accessToken,
-    refreshToken: refreshed.refreshToken ?? s.x_access_secret,
-    expiresIn: refreshed.expiresIn,
-  });
-  return refreshed.accessToken;
+  const lease = await acquireAccountLease("oauth-refresh", 30);
+  if (!lease)
+    throw new Error("X token refresh is in progress. Try again shortly.");
+  try {
+    const current = await getSettings();
+    if (current.x_access_token !== s.x_access_token)
+      return current.x_access_token;
+    const app = await getOAuth2AppClient();
+    const refreshed = await app.refreshOAuth2Token(
+      current.x_access_secret.trim(),
+    );
+    await saveOAuthTokens({
+      accessToken: refreshed.accessToken,
+      refreshToken: refreshed.refreshToken ?? current.x_access_secret,
+      expiresIn: refreshed.expiresIn,
+    });
+    return refreshed.accessToken;
+  } finally {
+    await releaseAccountLease("oauth-refresh", lease);
+  }
 }
 
 async function getWriteClient() {
@@ -169,8 +191,24 @@ export async function completeOAuth2Login(opts: {
     handle = me.data?.username;
     userId = me.data?.id;
   } catch {
-    /* optional */
+    throw new Error(
+      "Could not verify the X account identity. Please reconnect.",
+    );
   }
+  if (!userId || !handle) throw new Error("X returned no account identity");
+  const other = await inAccount(
+    accountId() === "personal" ? "company" : "personal",
+    () => getSettings(),
+  );
+  if (other.x_connected_user_id === userId)
+    throw new Error(
+      "This X account is already connected to the other profile. Choose a different X account.",
+    );
+  const current = await getSettings();
+  if (current.x_connected_user_id && current.x_connected_user_id !== userId)
+    throw new Error(
+      "This profile is already bound to another X account. Reconnect the same account to preserve its queue.",
+    );
 
   await saveOAuthTokens({
     accessToken: result.accessToken,
@@ -195,10 +233,20 @@ export async function verifyXWriteAuth(): Promise<{
       return { ok: false, message: "X returned no user for these credentials" };
     }
     const s = await getSettings();
+    if (s.x_connected_user_id && s.x_connected_user_id !== me.data.id)
+      throw new Error(
+        "X identity differs from this profile. Reconnect its original account before posting.",
+      );
     await updateSettings({
       x_connected_handle: me.data.username || s.x_connected_handle,
       x_connected_user_id: me.data.id,
-      ...(s.x_connected_user_id !== me.data.id ? { mentions_since_id: "" } : {}),
+      ...(s.x_connected_user_id !== me.data.id
+        ? {
+            mentions_since_id: "",
+            mentions_next_token: "",
+            mentions_pending_newest_id: "",
+          }
+        : {}),
     });
     return {
       ok: true,
@@ -227,7 +275,10 @@ function mimeForFile(filePath: string): {
     case ".png":
       return { media_type: EUploadMimeType.Png, media_category: "tweet_image" };
     case ".webp":
-      return { media_type: EUploadMimeType.Webp, media_category: "tweet_image" };
+      return {
+        media_type: EUploadMimeType.Webp,
+        media_category: "tweet_image",
+      };
     case ".gif":
       return { media_type: EUploadMimeType.Gif, media_category: "tweet_gif" };
     case ".mp4":
@@ -237,7 +288,10 @@ function mimeForFile(filePath: string): {
     case ".jpg":
     case ".jpeg":
     default:
-      return { media_type: EUploadMimeType.Jpeg, media_category: "tweet_image" };
+      return {
+        media_type: EUploadMimeType.Jpeg,
+        media_category: "tweet_image",
+      };
   }
 }
 
@@ -254,7 +308,7 @@ type UpsertPostRow = {
   posted_at: string | null;
 };
 
-export async function fetchWatchedPostsLast24h(): Promise<{
+async function fetchWatchedPostsLast24hUnlocked(): Promise<{
   inserted: number;
   scanned: number;
   skipped: number;
@@ -378,7 +432,9 @@ export async function fetchWatchedPostsLast24h(): Promise<{
       }
 
       for (const tweet of search.tweets) {
-        const author = tweet.author_id ? usersById.get(tweet.author_id) : undefined;
+        const author = tweet.author_id
+          ? usersById.get(tweet.author_id)
+          : undefined;
         const mediaKeys = tweet.attachments?.media_keys ?? [];
         const mediaUrls = mediaKeys
           .map((k) => mediaByKey.get(k))
@@ -427,18 +483,22 @@ async function getConnectedUserId(): Promise<string> {
   if (s.x_connected_user_id) return s.x_connected_user_id;
   const client = await getWriteClient();
   const me = await client.v2.me();
-  if (!me.data?.id) throw new Error("X returned no user for the connected account");
+  if (!me.data?.id)
+    throw new Error("X returned no user for the connected account");
   await updateSettings({ x_connected_user_id: me.data.id });
   return me.data.id;
 }
 
 /**
  * Pull new posts that @mention the connected account. These are the only posts
- * X lets this app reply to via the API. Uses the account's own user token so X
- * bills them as owned reads ($0.001 each), and `since_id` so each run only pays
- * for mentions it hasn't seen.
+ * this app permits for API replies. Uses the account's user token. Owned-read
+ * pricing only applies if that user owns the developer app. Pagination and
+ * since_id keep each run bounded without skipping a backlog.
  */
-export async function fetchMentions(): Promise<{ fetched: number; skipped?: string }> {
+async function fetchMentionsUnlocked(): Promise<{
+  fetched: number;
+  skipped?: string;
+}> {
   const settings = await getSettings();
   if (!settings.enable_mentions) return { fetched: 0, skipped: "disabled" };
   if (!settings.x_access_token) return { fetched: 0, skipped: "not connected" };
@@ -446,11 +506,19 @@ export async function fetchMentions(): Promise<{ fetched: number; skipped?: stri
   try {
     const userId = await getConnectedUserId();
     const client = await getWriteClient();
-    const maxResults = Math.min(100, Math.max(5, settings.mentions_max_results));
+    const maxResults = Math.min(
+      100,
+      Math.max(5, settings.mentions_max_results),
+    );
 
     const page = await client.v2.userMentionTimeline(userId, {
       max_results: maxResults,
-      ...(settings.mentions_since_id ? { since_id: settings.mentions_since_id } : {}),
+      ...(settings.mentions_since_id
+        ? { since_id: settings.mentions_since_id }
+        : {}),
+      ...(settings.mentions_next_token
+        ? { pagination_token: settings.mentions_next_token }
+        : {}),
       "tweet.fields": ["created_at", "author_id"],
       expansions: ["author_id"],
       "user.fields": ["username", "name"],
@@ -462,7 +530,9 @@ export async function fetchMentions(): Promise<{ fetched: number; skipped?: stri
     }
 
     for (const tweet of page.tweets) {
-      const author = tweet.author_id ? usersById.get(tweet.author_id) : undefined;
+      const author = tweet.author_id
+        ? usersById.get(tweet.author_id)
+        : undefined;
       await upsertMention({
         x_post_id: tweet.id,
         author_handle: author?.username ?? "unknown",
@@ -472,13 +542,36 @@ export async function fetchMentions(): Promise<{ fetched: number; skipped?: stri
       });
     }
 
-    if (page.meta?.newest_id) {
-      await updateSettings({ mentions_since_id: page.meta.newest_id });
+    const newest =
+      settings.mentions_pending_newest_id ||
+      page.meta?.newest_id ||
+      settings.mentions_since_id;
+    if (page.meta?.next_token) {
+      await updateSettings({
+        mentions_next_token: page.meta.next_token,
+        mentions_pending_newest_id: newest,
+      });
+    } else {
+      await updateSettings({
+        mentions_since_id: newest,
+        mentions_next_token: "",
+        mentions_pending_newest_id: "",
+      });
     }
-    await deleteOldMentions(7);
+    await deleteOldMentions(1);
 
     return { fetched: page.tweets.length };
   } catch (err) {
+    if (
+      settings.mentions_next_token &&
+      err instanceof ApiResponseError &&
+      err.code === 400
+    ) {
+      await updateSettings({
+        mentions_next_token: "",
+        mentions_pending_newest_id: "",
+      });
+    }
     throw new Error(formatXError(err));
   }
 }
@@ -496,11 +589,14 @@ async function loadMedia(p: string): Promise<Buffer> {
   const stored = await readMedia(base);
   if (stored) return stored;
   const legacy = path.join(getUploadsDir(), base);
-  if (fs.existsSync(legacy)) return fs.readFileSync(legacy);
+  if (accountId() === "company" && fs.existsSync(legacy))
+    return fs.readFileSync(legacy);
   throw new Error(`Media file missing: ${base}`);
 }
 
-export async function uploadMediaFiles(mediaPaths: string[]): Promise<string[]> {
+export async function uploadMediaFiles(
+  mediaPaths: string[],
+): Promise<string[]> {
   if (mediaPaths.length === 0) return [];
   const client = await getWriteClient();
   const mediaIds: string[] = [];
@@ -518,14 +614,22 @@ export async function uploadMediaFiles(mediaPaths: string[]): Promise<string[]> 
   return mediaIds;
 }
 
+export class UncertainPublishError extends Error {}
+
 export async function publishPost(opts: {
   text: string;
   replyToId?: string | null;
   quoteTweetId?: string | null;
   mediaPaths?: string[];
 }): Promise<string> {
+  let sending = false;
   try {
+    const validation = validateXText(opts.text);
+    if (validation) throw new Error(validation);
     const mediaPaths = opts.mediaPaths ?? [];
+    const videos = mediaPaths.filter((p) => /\.(mp4|mov|gif)$/i.test(p));
+    if (videos.length && mediaPaths.length > 1)
+      throw new Error("Use one video/GIF or up to four still images");
     if (mediaPaths.length > 4) {
       throw new Error("X allows at most 4 media attachments");
     }
@@ -556,10 +660,17 @@ export async function publishPost(opts: {
       payload.media = { media_ids: mediaIds as MediaTuple };
     }
 
+    sending = true;
     const result = await client.v2.tweet(payload);
     if (!result.data?.id) throw new Error("X API returned no post id");
     return result.data.id;
   } catch (err) {
+    if (sending && (!(err instanceof ApiResponseError) || err.code >= 500)) {
+      throw new UncertainPublishError(
+        "X delivery is uncertain. Check the account on X before creating another post. " +
+          formatXError(err),
+      );
+    }
     if (opts.replyToId && err instanceof ApiResponseError && err.code === 403) {
       throw new Error(
         "X refused this reply. The API only allows replies to posts that @mention your account or quote your post. Use Open in X to reply manually.",
@@ -576,3 +687,23 @@ export async function listFeed(limit = 100): Promise<FetchedPost[]> {
 }
 
 export type { Settings };
+
+export async function fetchWatchedPostsLast24h() {
+  const lease = await acquireAccountLease("fetchWatchedPostsLast24h", 300);
+  if (!lease) throw new Error("A refresh for this account is already running");
+  try {
+    return await fetchWatchedPostsLast24hUnlocked();
+  } finally {
+    await releaseAccountLease("fetchWatchedPostsLast24h", lease);
+  }
+}
+
+export async function fetchMentions() {
+  const lease = await acquireAccountLease("fetchMentions", 300);
+  if (!lease) throw new Error("A refresh for this account is already running");
+  try {
+    return await fetchMentionsUnlocked();
+  } finally {
+    await releaseAccountLease("fetchMentions", lease);
+  }
+}

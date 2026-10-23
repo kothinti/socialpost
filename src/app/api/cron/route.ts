@@ -1,3 +1,4 @@
+import { ACCOUNT_IDS, inAccount } from "@/lib/accounts";
 import { NextRequest } from "next/server";
 import { getSession } from "@/lib/auth";
 import { jsonError, jsonOk, unauthorized } from "@/lib/http";
@@ -34,12 +35,20 @@ async function runJob(req: NextRequest) {
   const url = new URL(req.url);
   const job = url.searchParams.get("job") || "all";
 
-  try {
-    if (job === "fetch") return jsonOk(await runDailyFetch());
-    if (job === "schedules") return jsonOk(await processDueSchedules());
-    if (job === "mentions") return jsonOk(await runMentionsFetch());
-    return jsonOk(await runCronBundle());
-  } catch (err) {
-    return jsonError(err instanceof Error ? err.message : "Cron failed", 500);
+  if (!["all", "fetch", "schedules", "mentions"].includes(job))
+    return jsonError("Invalid job");
+  const results: Record<string, unknown> = {};
+  for (const account of ACCOUNT_IDS) {
+    results[account] = await inAccount(account, async () => {
+      try {
+        if (job === "fetch") return await runDailyFetch();
+        if (job === "schedules") return await processDueSchedules();
+        if (job === "mentions") return await runMentionsFetch();
+        return await runCronBundle();
+      } catch (err) {
+        return { error: err instanceof Error ? err.message : "Cron failed" };
+      }
+    });
   }
+  return jsonOk(results);
 }

@@ -1,3 +1,4 @@
+import { accountRoute } from "@/lib/accounts";
 import { NextRequest } from "next/server";
 import { randomUUID } from "crypto";
 import { getSession } from "@/lib/auth";
@@ -13,7 +14,7 @@ const ALLOWED = new Set([
   "video/quicktime",
 ]);
 
-export async function POST(req: NextRequest) {
+async function handlePOST(req: NextRequest) {
   if (!(await getSession())) return unauthorized();
 
   const form = await req.formData();
@@ -55,3 +56,5 @@ function mimeExt(type: string) {
       return "";
   }
 }
+
+export const POST = accountRoute(handlePOST);

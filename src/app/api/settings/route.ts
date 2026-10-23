@@ -1,3 +1,5 @@
+import { accountId } from "@/lib/accounts";
+import { accountRoute } from "@/lib/accounts";
 import { NextRequest } from "next/server";
 import { getSession, requireAdmin } from "@/lib/auth";
 import { getSettings, updateSettings } from "@/lib/db";
@@ -10,6 +12,13 @@ import { publicOrigin } from "@/lib/origin";
 async function publicSettings(reqOrigin?: string) {
   const s = await getSettings();
   return {
+    publishing_paused: s.publishing_paused,
+    automation_paused: s.automation_paused,
+    editorial_topics: s.editorial_topics,
+    editorial_sources: s.editorial_sources,
+    editorial_style: s.editorial_style,
+    editorial_avoid: s.editorial_avoid,
+    account_id: accountId(),
     openai_model: s.openai_model,
     watched_handles: s.watched_handles,
     own_handle: s.own_handle,
@@ -37,6 +46,13 @@ async function publicSettings(reqOrigin?: string) {
 async function postingView() {
   const s = await getSettings();
   return {
+    publishing_paused: s.publishing_paused,
+    automation_paused: s.automation_paused,
+    editorial_topics: s.editorial_topics,
+    editorial_sources: s.editorial_sources,
+    editorial_style: s.editorial_style,
+    editorial_avoid: s.editorial_avoid,
+    account_id: accountId(),
     openai_model: s.openai_model,
     watched_handles: s.watched_handles,
     own_handle: s.own_handle,
@@ -61,7 +77,7 @@ async function postingView() {
   };
 }
 
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   const admin = await requireAdmin();
   if (admin) return jsonOk(await publicSettings(publicOrigin(req)));
 
@@ -71,6 +87,12 @@ export async function GET(req: NextRequest) {
 }
 
 const schema = z.object({
+  editorial_avoid: z.string().optional(),
+  editorial_style: z.string().optional(),
+  editorial_sources: z.string().optional(),
+  editorial_topics: z.string().optional(),
+  automation_paused: z.boolean().optional(),
+  publishing_paused: z.boolean().optional(),
   x_client_id: z.string().optional(),
   x_client_secret: z.string().optional(),
   x_bearer_token: z.string().optional(),
@@ -91,7 +113,7 @@ const schema = z.object({
   mentions_max_results: z.number().int().min(5).max(100).optional(),
 });
 
-export async function PUT(req: NextRequest) {
+async function handlePUT(req: NextRequest) {
   const session = await requireAdmin();
   if (!session) return forbidden();
 
@@ -102,17 +124,30 @@ export async function PUT(req: NextRequest) {
   const data = body.data;
 
   await updateSettings({
+    editorial_avoid: data.editorial_avoid ?? current.editorial_avoid,
+    editorial_style: data.editorial_style ?? current.editorial_style,
+    editorial_sources: data.editorial_sources ?? current.editorial_sources,
+    editorial_topics: data.editorial_topics ?? current.editorial_topics,
+    automation_paused: data.automation_paused ?? current.automation_paused,
+    publishing_paused: data.publishing_paused ?? current.publishing_paused,
     x_api_key: (data.x_client_id ?? current.x_api_key).trim(),
     x_api_secret: (data.x_client_secret ?? current.x_api_secret).trim(),
     x_bearer_token: (data.x_bearer_token ?? current.x_bearer_token).trim(),
-    x_redirect_uri: (data.x_redirect_uri ?? current.x_redirect_uri ?? "").trim(),
+    x_redirect_uri: (
+      data.x_redirect_uri ??
+      current.x_redirect_uri ??
+      ""
+    ).trim(),
     openai_api_key: (data.openai_api_key ?? current.openai_api_key).trim(),
     openai_model: data.openai_model ?? current.openai_model,
     watched_handles: (data.watched_handles ?? current.watched_handles)
       .map((h) => h.replace(/^@/, "").trim())
       .filter(Boolean),
-    own_handle: (data.own_handle ?? current.own_handle).replace(/^@/, "").trim(),
-    reply_system_prompt: data.reply_system_prompt ?? current.reply_system_prompt,
+    own_handle: (data.own_handle ?? current.own_handle)
+      .replace(/^@/, "")
+      .trim(),
+    reply_system_prompt:
+      data.reply_system_prompt ?? current.reply_system_prompt,
     compose_system_prompt:
       data.compose_system_prompt ?? current.compose_system_prompt,
     topic_keywords: normalizeKeywords(
@@ -141,3 +176,6 @@ export async function PUT(req: NextRequest) {
 
   return jsonOk(await publicSettings(publicOrigin(req)));
 }
+
+export const GET = accountRoute(handleGET);
+export const PUT = accountRoute(handlePUT);

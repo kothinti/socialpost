@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Hit the app cron endpoint (daily fetch + due schedules).
+ * Hit the app cron endpoint. Schedules by default; CRON_JOB=all for daily reads.
  * Usage: CRON_SECRET=... APP_URL=http://localhost:3000 node scripts/run-cron.mjs
  */
 const base = process.env.APP_URL || "http://localhost:3000";
@@ -11,11 +11,23 @@ if (!secret) {
   process.exit(1);
 }
 
-const res = await fetch(`${base}/api/cron?job=all`, {
+const job = process.env.CRON_JOB || "schedules";
+if (!["all", "schedules", "fetch", "mentions"].includes(job))
+  throw new Error("Invalid CRON_JOB");
+const res = await fetch(`${base}/api/cron?job=${job}`, {
   method: "POST",
   headers: { Authorization: `Bearer ${secret}` },
 });
 
 const body = await res.text();
 console.log(res.status, body);
-if (!res.ok) process.exit(1);
+function hasError(value) {
+  return (
+    value &&
+    typeof value === "object" &&
+    (Boolean(value.error) ||
+      value.ok === false ||
+      Object.values(value).some(hasError))
+  );
+}
+if (!res.ok || hasError(JSON.parse(body))) process.exit(1);

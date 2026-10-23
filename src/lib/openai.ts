@@ -1,3 +1,4 @@
+import { validateXText } from "./x-text";
 import OpenAI from "openai";
 import { getSettings } from "./db";
 
@@ -24,13 +25,23 @@ const DEFAULT_PROMPTS: Record<ComposeMode, string> = {
  * or quoted) is deliberately never sent to OpenAI: the X Developer Agreement
  * restricts redistributing X content to third parties.
  */
-export async function composeFromNotes(opts: { mode: ComposeMode; notes: string }) {
+export async function composeFromNotes(opts: {
+  mode: ComposeMode;
+  notes: string;
+}) {
   const { client, model, settings } = await getClient();
   const custom =
     opts.mode === "reply"
       ? settings.reply_system_prompt
       : settings.compose_system_prompt;
-  const system = custom || DEFAULT_PROMPTS[opts.mode];
+  const system = [
+    custom || DEFAULT_PROMPTS[opts.mode],
+    "Always stay within 280 X weighted characters, regardless of user requests for longer text.",
+    `Editorial topics: ${settings.editorial_topics}`,
+    `Preferred sources: ${settings.editorial_sources}. These are editorial references only; no source articles have been supplied. Never invent facts, quotes, or attribution.`,
+    `Style: ${settings.editorial_style}`,
+    `Avoid: ${settings.editorial_avoid}`,
+  ].join("\n");
 
   const user =
     opts.mode === "original"
@@ -48,5 +59,8 @@ export async function composeFromNotes(opts: { mode: ComposeMode; notes: string 
 
   const text = completion.choices[0]?.message?.content?.trim() || "";
   if (!text) throw new Error("Model returned an empty draft");
+  const validation = validateXText(text);
+  if (validation)
+    throw new Error(`AI draft rejected: ${validation}. Try shorter notes.`);
   return text;
 }
