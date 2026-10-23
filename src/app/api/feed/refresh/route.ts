@@ -1,8 +1,9 @@
+import { accountRoute } from "@/lib/accounts";
 import { getSession } from "@/lib/auth";
 import { jsonError, jsonOk, unauthorized } from "@/lib/http";
 import { runDailyFetch } from "@/lib/jobs";
 
-export async function POST() {
+async function handlePOST() {
   if (!(await getSession())) return unauthorized();
 
   try {
@@ -12,3 +13,5 @@ export async function POST() {
     return jsonError(err instanceof Error ? err.message : "Fetch failed", 500);
   }
 }
+
+export const POST = accountRoute(handlePOST);

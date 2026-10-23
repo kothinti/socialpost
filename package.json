@@ -10,13 +10,8 @@
     "build": "next build",
     "start": "next start -H 0.0.0.0 -p ${PORT:-3000}",
     "lint": "eslint",
-    "cron": "node scripts/run-cron.mjs"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "sharp",
-      "unrs-resolver"
-    ]
+    "cron": "node scripts/run-cron.mjs",
+    "test": "tsx --test tests/*.test.ts"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
@@ -27,6 +22,7 @@
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "twitter-api-v2": "^1.29.0",
+    "twitter-text": "^3.1.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
@@ -35,9 +31,12 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@types/twitter-text": "^3.1.10",
     "eslint": "^9",
     "eslint-config-next": "16.2.10",
+    "mongodb-memory-server": "^11.3.0",
     "tailwindcss": "^4",
+    "tsx": "^4.23.15",
     "typescript": "^5"
   }
 }

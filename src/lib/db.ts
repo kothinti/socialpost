@@ -1,3 +1,5 @@
+import { accountCollection, accountId } from "./accounts";
+import { EMPTY_EDITORIAL, PERSONAL_EDITORIAL } from "./editorial";
 import {
   GridFSBucket,
   MongoClient,
@@ -31,7 +33,9 @@ function ensureDataDirs() {
 
 ensureDataDirs();
 
-const SETTINGS_ID = "app";
+function settingsId() {
+  return accountId() === "company" ? "app" : "personal";
+}
 
 export type UserRole = "admin" | "posting";
 
@@ -46,6 +50,12 @@ export type UserDoc = {
 };
 
 export type Settings = {
+  publishing_paused: boolean;
+  automation_paused: boolean;
+  editorial_topics: string;
+  editorial_sources: string;
+  editorial_style: string;
+  editorial_avoid: string;
   x_api_key: string;
   x_api_secret: string;
   x_access_token: string;
@@ -72,6 +82,8 @@ export type Settings = {
   mentions_max_results: number;
   /** Newest mention id already fetched, so each fetch only pays for new mentions. */
   mentions_since_id: string;
+  mentions_next_token: string;
+  mentions_pending_newest_id: string;
   updated_at: string;
 };
 
@@ -110,7 +122,14 @@ type FetchedPostDoc = {
   fetched_at: Date;
 };
 
-export type DraftStatus = "draft" | "scheduled" | "posting" | "posted" | "failed";
+export type DraftStatus =
+  | "draft"
+  | "scheduled"
+  | "posting"
+  | "posted"
+  | "failed"
+  | "pending_approval"
+  | "uncertain";
 
 export type DraftType = "reply" | "quote" | "original";
 
@@ -181,6 +200,9 @@ type JobRunDoc = {
 };
 
 const DEFAULT_SETTINGS: Omit<SettingsDoc, "_id" | "updated_at"> = {
+  publishing_paused: false,
+  automation_paused: false,
+  ...EMPTY_EDITORIAL,
   x_api_key: "",
   x_api_secret: "",
   x_access_token: "",
@@ -205,6 +227,8 @@ const DEFAULT_SETTINGS: Omit<SettingsDoc, "_id" | "updated_at"> = {
   enable_mentions: true,
   mentions_max_results: 20,
   mentions_since_id: "",
+  mentions_next_token: "",
+  mentions_pending_newest_id: "",
 };
 
 const globalForMongo = globalThis as unknown as {
@@ -243,7 +267,10 @@ function formatMongoError(err: unknown): string {
 }
 
 export async function getMongo(): Promise<Db> {
-  if (globalForMongo.__mongoDb) return globalForMongo.__mongoDb;
+  if (globalForMongo.__mongoDb) {
+    await globalForMongo.__mongoIndexes;
+    return globalForMongo.__mongoDb;
+  }
 
   try {
     const uri = requireUri();
@@ -283,22 +310,34 @@ export async function getMongo(): Promise<Db> {
 async function ensureIndexes(db: Db) {
   await db.collection("users").createIndex({ email: 1 }, { unique: true });
   await db
-    .collection("fetched_posts")
-    .createIndex({ x_post_id: 1 }, { unique: true });
-  await db.collection("fetched_posts").createIndex({ posted_at: -1 });
-  await db.collection("drafts").createIndex({ status: 1, scheduled_at: 1 });
-  await db.collection("job_runs").createIndex({ ran_at: -1 });
-  await db.collection("mentions").createIndex({ x_post_id: 1 }, { unique: true });
-  await db.collection("mentions").createIndex({ posted_at: -1 });
-
-  const settings = db.collection<SettingsDoc>("settings");
-  const existing = await settings.findOne({ _id: SETTINGS_ID });
-  if (!existing) {
-    await settings.insertOne({
-      _id: SETTINGS_ID,
-      ...DEFAULT_SETTINGS,
-      updated_at: new Date(),
-    });
+    .collection("settings")
+    .createIndex(
+      { x_connected_user_id: 1 },
+      {
+        unique: true,
+        partialFilterExpression: { x_connected_user_id: { $gt: "" } },
+      },
+    );
+  for (const prefix of ["", "personal_"]) {
+    for (const collection of ["fetched_posts", "mentions"]) {
+      await db
+        .collection(`${prefix}${collection}`)
+        .createIndex({ fetched_at: 1 }, { expireAfterSeconds: 24 * 60 * 60 });
+    }
+    await db
+      .collection(`${prefix}fetched_posts`)
+      .createIndex({ x_post_id: 1 }, { unique: true });
+    await db
+      .collection(`${prefix}fetched_posts`)
+      .createIndex({ posted_at: -1 });
+    await db
+      .collection(`${prefix}drafts`)
+      .createIndex({ status: 1, scheduled_at: 1 });
+    await db.collection(`${prefix}job_runs`).createIndex({ ran_at: -1 });
+    await db
+      .collection(`${prefix}mentions`)
+      .createIndex({ x_post_id: 1 }, { unique: true });
+    await db.collection(`${prefix}mentions`).createIndex({ posted_at: -1 });
   }
 }
 
@@ -311,19 +350,19 @@ function settingsCol(db: Db): Collection<SettingsDoc> {
 }
 
 function postsCol(db: Db): Collection<FetchedPostDoc> {
-  return db.collection<FetchedPostDoc>("fetched_posts");
+  return db.collection<FetchedPostDoc>(accountCollection("fetched_posts"));
 }
 
 function draftsCol(db: Db): Collection<DraftDoc> {
-  return db.collection<DraftDoc>("drafts");
+  return db.collection<DraftDoc>(accountCollection("drafts"));
 }
 
 function mentionsCol(db: Db): Collection<MentionDoc> {
-  return db.collection<MentionDoc>("mentions");
+  return db.collection<MentionDoc>(accountCollection("mentions"));
 }
 
 function jobsCol(db: Db): Collection<JobRunDoc> {
-  return db.collection<JobRunDoc>("job_runs");
+  return db.collection<JobRunDoc>(accountCollection("job_runs"));
 }
 
 function toIso(d: Date | null | undefined): string | null {
@@ -340,6 +379,24 @@ function parseDate(input: string | Date | null | undefined): Date | null {
 
 function mapSettings(doc: SettingsDoc): Settings {
   return {
+    publishing_paused: doc.publishing_paused ?? false,
+    automation_paused: doc.automation_paused ?? false,
+    editorial_topics:
+      doc.editorial_topics ??
+      (accountId() === "personal" ? PERSONAL_EDITORIAL : EMPTY_EDITORIAL)
+        .editorial_topics,
+    editorial_sources:
+      doc.editorial_sources ??
+      (accountId() === "personal" ? PERSONAL_EDITORIAL : EMPTY_EDITORIAL)
+        .editorial_sources,
+    editorial_style:
+      doc.editorial_style ??
+      (accountId() === "personal" ? PERSONAL_EDITORIAL : EMPTY_EDITORIAL)
+        .editorial_style,
+    editorial_avoid:
+      doc.editorial_avoid ??
+      (accountId() === "personal" ? PERSONAL_EDITORIAL : EMPTY_EDITORIAL)
+        .editorial_avoid,
     x_api_key: doc.x_api_key ?? "",
     x_api_secret: doc.x_api_secret ?? "",
     x_access_token: doc.x_access_token ?? "",
@@ -351,7 +408,9 @@ function mapSettings(doc: SettingsDoc): Settings {
     x_connected_user_id: doc.x_connected_user_id ?? "",
     openai_api_key: doc.openai_api_key ?? "",
     openai_model: doc.openai_model || "gpt-4o-mini",
-    watched_handles: Array.isArray(doc.watched_handles) ? doc.watched_handles : [],
+    watched_handles: Array.isArray(doc.watched_handles)
+      ? doc.watched_handles
+      : [],
     own_handle: doc.own_handle ?? "",
     reply_system_prompt: doc.reply_system_prompt ?? "",
     compose_system_prompt: doc.compose_system_prompt ?? "",
@@ -365,6 +424,8 @@ function mapSettings(doc: SettingsDoc): Settings {
     mentions_max_results:
       Number(doc.mentions_max_results) || DEFAULT_SETTINGS.mentions_max_results,
     mentions_since_id: doc.mentions_since_id ?? "",
+    mentions_next_token: doc.mentions_next_token ?? "",
+    mentions_pending_newest_id: doc.mentions_pending_newest_id ?? "",
     updated_at: toIso(doc.updated_at) ?? new Date().toISOString(),
   };
 }
@@ -432,15 +493,20 @@ export function publicUser(user: UserDoc) {
 
 export async function getSettings(): Promise<Settings> {
   const db = await getMongo();
-  const doc = await settingsCol(db).findOne({ _id: SETTINGS_ID });
+  const doc = await settingsCol(db).findOne({ _id: settingsId() });
   if (!doc) {
     const fresh: SettingsDoc = {
-      _id: SETTINGS_ID,
+      _id: settingsId(),
       ...DEFAULT_SETTINGS,
+      ...(accountId() === "personal" ? PERSONAL_EDITORIAL : {}),
       updated_at: new Date(),
     };
-    await settingsCol(db).insertOne(fresh);
-    return mapSettings(fresh);
+    await settingsCol(db).updateOne(
+      { _id: settingsId() },
+      { $setOnInsert: fresh },
+      { upsert: true },
+    );
+    return mapSettings((await settingsCol(db).findOne({ _id: settingsId() }))!);
   }
   return mapSettings(doc);
 }
@@ -450,7 +516,7 @@ export async function updateSettings(
 ): Promise<Settings> {
   const db = await getMongo();
   await settingsCol(db).updateOne(
-    { _id: SETTINGS_ID },
+    { _id: settingsId() },
     { $set: { ...patch, updated_at: new Date() } },
     { upsert: true },
   );
@@ -481,6 +547,8 @@ export async function saveOAuthTokens(opts: {
       // Different account: its mentions cursor doesn't apply.
       patch.x_connected_user_id = opts.userId;
       patch.mentions_since_id = "";
+      patch.mentions_next_token = "";
+      patch.mentions_pending_newest_id = "";
     }
   }
 
@@ -596,7 +664,7 @@ export async function deleteOldFetchedPosts(olderThanHours: number) {
   const db = await getMongo();
   const cutoff = new Date(Date.now() - olderThanHours * 60 * 60 * 1000);
   await postsCol(db).deleteMany({
-    posted_at: { $ne: null, $lt: cutoff },
+    fetched_at: { $lt: cutoff },
   });
 }
 
@@ -608,6 +676,7 @@ export async function listFetchedPostsSince(
   const since = new Date(Date.now() - hours * 60 * 60 * 1000);
   const docs = await postsCol(db)
     .find({
+      fetched_at: { $gte: since },
       $or: [{ posted_at: null }, { posted_at: { $gte: since } }],
     })
     .sort({ posted_at: -1 })
@@ -626,6 +695,8 @@ export async function listDrafts(): Promise<Draft[]> {
   const db = await getMongo();
   const docs = await draftsCol(db).find({}).toArray();
   const statusOrder: Record<string, number> = {
+    pending_approval: 0,
+    uncertain: 0,
     posting: 0,
     scheduled: 0,
     draft: 1,
@@ -657,7 +728,7 @@ export async function createDraft(input: {
   reply_to_handle?: string | null;
   reply_to_content?: string | null;
   media_paths?: string[];
-  status: "draft" | "scheduled";
+  status: "draft" | "scheduled" | "pending_approval";
   scheduled_at?: string | null;
   created_by_user_id?: string | null;
 }): Promise<Draft> {
@@ -700,6 +771,7 @@ export async function updateDraft(
   }>,
   /** Only apply the patch if the draft is still in one of these statuses. */
   onlyIfStatus?: DraftStatus[],
+  onlyIfUpdatedAt?: string,
 ): Promise<Draft | null> {
   if (!ObjectId.isValid(id)) return null;
   const db = await getMongo();
@@ -710,12 +782,14 @@ export async function updateDraft(
   if (patch.scheduled_at !== undefined) {
     $set.scheduled_at = parseDate(patch.scheduled_at);
   }
-  if (patch.posted_at !== undefined) $set.posted_at = parseDate(patch.posted_at);
+  if (patch.posted_at !== undefined)
+    $set.posted_at = parseDate(patch.posted_at);
   if (patch.x_post_id !== undefined) $set.x_post_id = patch.x_post_id;
   if (patch.error !== undefined) $set.error = patch.error;
 
   const filter: Record<string, unknown> = { _id: new ObjectId(id) };
   if (onlyIfStatus) filter.status = { $in: onlyIfStatus };
+  if (onlyIfUpdatedAt) filter.updated_at = new Date(onlyIfUpdatedAt);
 
   const result = await draftsCol(db).findOneAndUpdate(
     filter,
@@ -728,7 +802,10 @@ export async function updateDraft(
 export async function deleteDraft(id: string): Promise<boolean> {
   if (!ObjectId.isValid(id)) return false;
   const db = await getMongo();
-  const result = await draftsCol(db).deleteOne({ _id: new ObjectId(id) });
+  const result = await draftsCol(db).deleteOne({
+    _id: new ObjectId(id),
+    status: { $nin: ["posting", "uncertain"] },
+  });
   return result.deletedCount > 0;
 }
 
@@ -797,7 +874,7 @@ export async function upsertMention(row: {
 export async function listMentions(limit = 100): Promise<Mention[]> {
   const db = await getMongo();
   const docs = await mentionsCol(db)
-    .find({})
+    .find({ fetched_at: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } })
     .sort({ posted_at: -1 })
     .limit(limit)
     .toArray();
@@ -805,13 +882,21 @@ export async function listMentions(limit = 100): Promise<Mention[]> {
 }
 
 /** A post we may reply to via the API: X only allows replies to posts that mention us. */
-export async function findMentionByXId(xPostId: string): Promise<Mention | null> {
+export async function findMentionByXId(
+  xPostId: string,
+): Promise<Mention | null> {
   const db = await getMongo();
-  const doc = await mentionsCol(db).findOne({ x_post_id: xPostId });
+  const doc = await mentionsCol(db).findOne({
+    x_post_id: xPostId,
+    fetched_at: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+  });
   return doc ? mapMention(doc) : null;
 }
 
-export async function markMentionReplied(xPostId: string, replyXPostId: string) {
+export async function markMentionReplied(
+  xPostId: string,
+  replyXPostId: string,
+) {
   const db = await getMongo();
   await mentionsCol(db).updateOne(
     { x_post_id: xPostId },
@@ -822,7 +907,7 @@ export async function markMentionReplied(xPostId: string, replyXPostId: string) 
 export async function deleteOldMentions(olderThanDays: number) {
   const db = await getMongo();
   const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000);
-  await mentionsCol(db).deleteMany({ posted_at: { $ne: null, $lt: cutoff } });
+  await mentionsCol(db).deleteMany({ fetched_at: { $lt: cutoff } });
 }
 
 /**
@@ -830,7 +915,7 @@ export async function deleteOldMentions(olderThanDays: number) {
  * run that publishes later) can read it; local disk / /tmp is per-instance.
  */
 function mediaBucket(db: Db) {
-  return new GridFSBucket(db, { bucketName: "media" });
+  return new GridFSBucket(db, { bucketName: accountCollection("media") });
 }
 
 export async function saveMedia(
@@ -873,7 +958,9 @@ export async function logJob(job: string, status: string, detail?: string) {
 }
 
 /** @deprecated kept for callers that still pass JSON strings during transition */
-export function parseJsonArray(value: string | string[] | null | undefined): string[] {
+export function parseJsonArray(
+  value: string | string[] | null | undefined,
+): string[] {
   if (!value) return [];
   if (Array.isArray(value)) return value.map(String);
   try {
@@ -882,4 +969,60 @@ export function parseJsonArray(value: string | string[] | null | undefined): str
   } catch {
     return [];
   }
+}
+
+/** Cross-process leases prevent token rotation and paid fetches from overlapping. */
+export async function acquireAccountLease(
+  key: string,
+  seconds = 120,
+): Promise<string | null> {
+  const db = await getMongo();
+  const token = new ObjectId().toHexString();
+  const col = db.collection<{ _id: string; token: string; expires: Date }>(
+    accountCollection("leases"),
+  );
+  try {
+    const result = await col.findOneAndUpdate(
+      { _id: key, expires: { $lte: new Date() } },
+      { $set: { token, expires: new Date(Date.now() + seconds * 1000) } },
+      { upsert: true, returnDocument: "after" },
+    );
+    return result?.token === token ? token : null;
+  } catch (err) {
+    if ((err as { code?: number }).code === 11000) return null;
+    throw err;
+  }
+}
+export async function releaseAccountLease(key: string, token: string) {
+  const db = await getMongo();
+  await db
+    .collection<{ _id: string; token: string }>(accountCollection("leases"))
+    .deleteOne({ _id: key, token });
+}
+
+/** Persistent claims also block duplicates after a timeout with an unknown outcome. */
+export async function claimPublication(
+  key: string,
+  draftId: string,
+): Promise<boolean> {
+  const db = await getMongo();
+  try {
+    await db
+      .collection<{ _id: string; draftId: string }>(
+        accountCollection("publication_claims"),
+      )
+      .insertOne({ _id: key, draftId });
+    return true;
+  } catch (err) {
+    if ((err as { code?: number }).code === 11000) return false;
+    throw err;
+  }
+}
+export async function releasePublication(key: string, draftId: string) {
+  const db = await getMongo();
+  await db
+    .collection<{ _id: string; draftId: string }>(
+      accountCollection("publication_claims"),
+    )
+    .deleteOne({ _id: key, draftId });
 }

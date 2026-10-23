@@ -1,3 +1,8 @@
+import { createHash } from "node:crypto";
+import { claimPublication, releasePublication } from "./db";
+import { getSettings } from "./db";
+import { validateXText } from "./x-text";
+import { UncertainPublishError } from "./x";
 import {
   claimDraftForPosting,
   findMentionByXId,
@@ -29,11 +34,38 @@ export async function publishDraft(
   const content = overrides.content ?? draft.content;
   const mediaPaths = overrides.media_paths ?? draft.media_paths;
 
+  let publishedId: string | null = null;
+  let claimedKey: string | null = null;
   try {
-    if (draft.type === "reply" && !(await canReplyViaApi(draft.reply_to_x_id))) {
+    if ((await getSettings()).publishing_paused)
+      throw new Error("Publishing is paused for this account");
+    const validation = validateXText(content);
+    if (validation) throw new Error(validation);
+    if (
+      draft.type === "reply" &&
+      !(await canReplyViaApi(draft.reply_to_x_id))
+    ) {
       throw new Error(REPLY_NOT_ALLOWED);
     }
 
+    const key =
+      draft.type === "reply"
+        ? `reply:${draft.reply_to_x_id}`
+        : createHash("sha256")
+            .update(
+              JSON.stringify([
+                draft.type,
+                content.normalize("NFC").trim(),
+                draft.reply_to_x_id,
+                mediaPaths,
+              ]),
+            )
+            .digest("hex");
+    if (!(await claimPublication(key, draft.id)))
+      throw new Error(
+        "Duplicate post or reply blocked. Check the queue and X before retrying.",
+      );
+    claimedKey = key;
     const xPostId = await publishPost({
       text: content,
       replyToId: draft.type === "reply" ? draft.reply_to_x_id : null,
@@ -41,9 +73,7 @@ export async function publishDraft(
       mediaPaths,
     });
 
-    if (draft.type === "reply" && draft.reply_to_x_id) {
-      await markMentionReplied(draft.reply_to_x_id, xPostId);
-    }
+    publishedId = xPostId;
 
     const updated = await updateDraft(draft.id, {
       content,
@@ -54,15 +84,32 @@ export async function publishDraft(
       error: null,
       scheduled_at: null,
     });
-    return { ok: true, draft: updated! };
+    if (!updated) throw new Error("Published but could not record draft");
+    if (draft.type === "reply" && draft.reply_to_x_id)
+      await markMentionReplied(draft.reply_to_x_id, xPostId);
+    return { ok: true, draft: updated };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await updateDraft(draft.id, { status: "failed", error: message });
+    if (claimedKey && !publishedId && !(err instanceof UncertainPublishError))
+      await releasePublication(claimedKey, draft.id);
+    await updateDraft(draft.id, {
+      status: publishedId
+        ? "posted"
+        : err instanceof UncertainPublishError
+          ? "uncertain"
+          : "failed",
+      ...(publishedId
+        ? { x_post_id: publishedId, posted_at: new Date().toISOString() }
+        : {}),
+      error: message,
+    });
     return { ok: false, error: message };
   }
 }
 
 export async function runDailyFetch() {
+  if ((await getSettings()).automation_paused)
+    return { skipped: "automation paused" };
   try {
     const result = await fetchWatchedPostsLast24h();
     await logJob(
@@ -79,12 +126,16 @@ export async function runDailyFetch() {
 }
 
 export async function runMentionsFetch() {
+  if ((await getSettings()).automation_paused)
+    return { skipped: "automation paused" };
   try {
     const result = await fetchMentions();
     await logJob(
       "mentions_fetch",
       "ok",
-      result.skipped ? `skipped=${result.skipped}` : `fetched=${result.fetched}`,
+      result.skipped
+        ? `skipped=${result.skipped}`
+        : `fetched=${result.fetched}`,
     );
     return result;
   } catch (err) {
@@ -95,9 +146,15 @@ export async function runMentionsFetch() {
 }
 
 export async function processDueSchedules() {
+  const settings = await getSettings();
+  if (settings.publishing_paused || settings.automation_paused) return [];
   const dueDrafts = await listDueDrafts();
-  const results: { id: string; ok: boolean; error?: string; xPostId?: string }[] =
-    [];
+  const results: {
+    id: string;
+    ok: boolean;
+    error?: string;
+    xPostId?: string;
+  }[] = [];
 
   for (const due of dueDrafts) {
     const draft = await claimDraftForPosting(due.id, ["scheduled"], {
@@ -109,7 +166,11 @@ export async function processDueSchedules() {
     const result = await publishDraft(draft);
     results.push(
       result.ok
-        ? { id: draft.id, ok: true, xPostId: result.draft.x_post_id ?? undefined }
+        ? {
+            id: draft.id,
+            ok: true,
+            xPostId: result.draft.x_post_id ?? undefined,
+          }
         : { id: draft.id, ok: false, error: result.error },
     );
   }

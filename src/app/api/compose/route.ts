@@ -1,3 +1,4 @@
+import { accountRoute } from "@/lib/accounts";
 import { NextRequest } from "next/server";
 import { getSession } from "@/lib/auth";
 import { jsonError, jsonOk, unauthorized } from "@/lib/http";
@@ -8,9 +9,9 @@ import { z } from "zod";
 const schema = z.object({
   mode: z.enum(["reply", "quote", "original"]),
   notes: z.string().trim().min(1),
-});
+}).strict();
 
-export async function POST(req: NextRequest) {
+async function handlePOST(req: NextRequest) {
   if (!(await getSession())) return unauthorized();
 
   const body = schema.safeParse(await req.json().catch(() => null));
@@ -23,3 +24,5 @@ export async function POST(req: NextRequest) {
     return jsonError(err instanceof Error ? err.message : "Compose failed", 500);
   }
 }
+
+export const POST = accountRoute(handlePOST);

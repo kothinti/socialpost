@@ -1,3 +1,6 @@
+import { validateXText } from "@/lib/x-text";
+import { getSettings } from "@/lib/db";
+import { accountRoute } from "@/lib/accounts";
 import { NextRequest } from "next/server";
 import { getSession } from "@/lib/auth";
 import {
@@ -18,7 +21,7 @@ function serialize(d: Draft) {
   return d;
 }
 
-export async function GET() {
+async function handleGET() {
   if (!(await getSession())) return unauthorized();
   const drafts = await listDrafts();
   return jsonOk({ drafts: drafts.map(serialize) });
@@ -30,30 +33,44 @@ const createSchema = z.object({
   /** Post replied to or quoted. */
   reply_to_x_id: z.string().optional(),
   reply_to_handle: z.string().optional(),
-  media_paths: z.array(z.string()).optional(),
-  status: z.enum(["draft", "scheduled"]).optional(),
+  media_paths: z.array(z.string()).max(4).optional(),
+  status: z.enum(["draft", "scheduled", "pending_approval"]).optional(),
   scheduled_at: z.string().nullable().optional(),
 });
 
-export async function POST(req: NextRequest) {
+async function handlePOST(req: NextRequest) {
   const session = await getSession();
   if (!session) return unauthorized();
 
-  const body = createSchema.safeParse(await req.json());
+  const body = createSchema.safeParse(await req.json().catch(() => null));
   if (!body.success) return jsonError("Invalid draft");
 
   if (body.data.type !== "original" && !body.data.reply_to_x_id) {
     return jsonError("reply_to_x_id required for replies and quotes");
   }
-  if (body.data.type === "reply" && !(await canReplyViaApi(body.data.reply_to_x_id))) {
+  if (
+    body.data.type === "reply" &&
+    !(await canReplyViaApi(body.data.reply_to_x_id))
+  ) {
     return jsonError(REPLY_NOT_ALLOWED);
   }
 
-  const status = body.data.status ?? "draft";
+  const validation = validateXText(body.data.content);
+  if (validation) return jsonError(validation);
+  const status =
+    session.role !== "admin" && body.data.status === "scheduled"
+      ? "pending_approval"
+      : (body.data.status ?? "draft");
   if (status === "scheduled" && !body.data.scheduled_at) {
     return jsonError("scheduled_at required when scheduling");
   }
 
+  if (
+    body.data.scheduled_at &&
+    (!Number.isFinite(Date.parse(body.data.scheduled_at)) ||
+      Date.parse(body.data.scheduled_at) <= Date.now())
+  )
+    return jsonError("Pick a valid future schedule time");
   const scheduledAt = body.data.scheduled_at
     ? toIsoUtc(body.data.scheduled_at)
     : null;
@@ -75,29 +92,79 @@ export async function POST(req: NextRequest) {
 
 const actionSchema = z.object({
   id: z.string(),
-  action: z.enum(["update", "schedule", "post", "delete"]),
+  action: z.enum(["update", "schedule", "post", "delete", "submit", "approve"]),
   content: z.string().optional(),
-  media_paths: z.array(z.string()).optional(),
+  media_paths: z.array(z.string()).max(4).optional(),
   scheduled_at: z.string().nullable().optional(),
 });
 
-export async function PATCH(req: NextRequest) {
-  if (!(await getSession())) return unauthorized();
+async function handlePATCH(req: NextRequest) {
+  const session = await getSession();
+  if (!session) return unauthorized();
 
-  const body = actionSchema.safeParse(await req.json());
+  const body = actionSchema.safeParse(await req.json().catch(() => null));
   if (!body.success) return jsonError("Invalid request");
 
   const draft = await findDraftById(body.data.id);
   if (!draft) return jsonError("Draft not found", 404);
 
   if (body.data.action === "delete") {
-    await deleteDraft(body.data.id);
+    if (!(await deleteDraft(body.data.id)))
+      return jsonError("Cannot delete a posting or uncertain draft", 409);
     return jsonOk({ ok: true });
   }
 
-  if (draft.status === "posting" || draft.status === "posted") {
+  if (
+    draft.status === "posting" ||
+    draft.status === "posted" ||
+    draft.status === "uncertain"
+  ) {
     return jsonError(`Draft is already ${draft.status}`, 409);
   }
+
+  const validation = validateXText(body.data.content ?? draft.content);
+  if (validation) return jsonError(validation);
+  if (
+    body.data.scheduled_at &&
+    (!Number.isFinite(Date.parse(body.data.scheduled_at)) ||
+      Date.parse(body.data.scheduled_at) <= Date.now())
+  )
+    return jsonError("Pick a valid future schedule time");
+  if (body.data.action === "submit" || body.data.action === "approve") {
+    const approving = body.data.action === "approve";
+    if (approving && session.role !== "admin")
+      return jsonError("Admin approval required", 403);
+    if (approving && draft.status !== "pending_approval")
+      return jsonError("Draft is not awaiting approval", 409);
+    if (
+      approving &&
+      draft.scheduled_at &&
+      Date.parse(draft.scheduled_at) <= Date.now()
+    )
+      return jsonError("Schedule has passed; update it before approval");
+    const updated = await updateDraft(
+      draft.id,
+      {
+        status: approving
+          ? draft.scheduled_at
+            ? "scheduled"
+            : "draft"
+          : "pending_approval",
+        error: null,
+      },
+      [draft.status],
+      draft.updated_at,
+    );
+    if (!updated) return jsonError("Draft changed; refresh and retry", 409);
+    return jsonOk({ draft: updated });
+  }
+  if (
+    body.data.action === "post" &&
+    (session.role !== "admin" || draft.status === "pending_approval")
+  )
+    return jsonError("Admin approval required before posting", 403);
+  if (body.data.action === "post" && (await getSettings()).publishing_paused)
+    return jsonError("Publishing is paused for this account", 409);
 
   if (body.data.action === "update" || body.data.action === "schedule") {
     const content = body.data.content ?? draft.content;
@@ -115,7 +182,13 @@ export async function PATCH(req: NextRequest) {
     }
 
     const nextStatus =
-      body.data.action === "schedule" || scheduledAt ? "scheduled" : "draft";
+      draft.status === "pending_approval" ||
+      (session.role !== "admin" &&
+        (body.data.action === "schedule" || scheduledAt))
+        ? "pending_approval"
+        : body.data.action === "schedule" || scheduledAt
+          ? "scheduled"
+          : "draft";
 
     const updated = await updateDraft(
       draft.id,
@@ -126,7 +199,8 @@ export async function PATCH(req: NextRequest) {
         scheduled_at: scheduledAt,
         error: null,
       },
-      ["draft", "scheduled", "failed"],
+      [draft.status],
+      draft.updated_at,
     );
     if (!updated) return jsonError("Draft is already being posted", 409);
 
@@ -148,3 +222,7 @@ export async function PATCH(req: NextRequest) {
   if (!result.ok) return jsonError(result.error, 500);
   return jsonOk({ draft: serialize(result.draft) });
 }
+
+export const GET = accountRoute(handleGET);
+export const POST = accountRoute(handlePOST);
+export const PATCH = accountRoute(handlePATCH);

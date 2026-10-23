@@ -5,7 +5,7 @@ export type FeedFilterSettings = {
   min_like_count: number;
   min_reply_count: number;
   min_repost_count: number;
-  /** When true and keywords are set, also query X recent search (operators push filters to the API). */
+  /** When true and keywords are set, also query X recent search with these keywords. */
   enable_topic_search: boolean;
 };
 
@@ -65,7 +65,11 @@ export function passesFeedFilters(
   filters: FeedFilterSettings,
 ): boolean {
   if (
-    !matchesKeywords(post.content, filters.topic_keywords, filters.keyword_exact_match)
+    !matchesKeywords(
+      post.content,
+      filters.topic_keywords,
+      filters.keyword_exact_match,
+    )
   ) {
     return false;
   }
@@ -80,21 +84,27 @@ export function passesFeedFilters(
 }
 
 /**
- * Build an X recent-search query. Engagement operators are applied server-side
- * so fewer tweets are returned (and billed) when thresholds are set.
+ * Build an X recent-search query. Engagement thresholds are applied locally; recent search does not support web engagement operators.
  */
-export function buildTopicSearchQuery(filters: FeedFilterSettings): string | null {
+export function buildTopicSearchQuery(
+  filters: FeedFilterSettings,
+): string | null {
   const keywords = filters.topic_keywords;
   if (keywords.length === 0) return null;
 
-  const phraseParts = keywords.map((kw) => {
-    const cleaned = kw.replace(/"/g, "").trim();
-    if (!cleaned) return null;
-    if (filters.keyword_exact_match) {
-      return `"${cleaned}"`;
-    }
-    return `(${cleaned})`;
-  }).filter((p): p is string => Boolean(p));
+  const phraseParts = keywords
+    .map((kw) => {
+      const cleaned = kw.replace(/"/g, "").trim();
+      if (!cleaned) return null;
+      if (filters.keyword_exact_match) {
+        return `"${cleaned}"`;
+      }
+      return `(${cleaned
+        .split(/\s+/)
+        .map((word) => `"${word}"`)
+        .join(" ")})`;
+    })
+    .filter((p): p is string => Boolean(p));
 
   if (phraseParts.length === 0) return null;
 
@@ -102,16 +112,12 @@ export function buildTopicSearchQuery(filters: FeedFilterSettings): string | nul
     phraseParts.length === 1 ? phraseParts[0] : `(${phraseParts.join(" OR ")})`;
 
   const parts = [topicClause, "-is:retweet", "-is:reply"];
-  if (filters.min_like_count > 0) {
-    parts.push(`min_faves:${filters.min_like_count}`);
-  }
-  if (filters.min_reply_count > 0) {
-    parts.push(`min_replies:${filters.min_reply_count}`);
-  }
-  if (filters.min_repost_count > 0) {
-    parts.push(`min_retweets:${filters.min_repost_count}`);
-  }
-  return parts.join(" ");
+  const query = parts.join(" ");
+  if (query.length > 512)
+    throw new Error(
+      "Topic search query exceeds X’s 512-character limit. Use fewer or shorter keywords.",
+    );
+  return query;
 }
 
 export function clampNonNegInt(value: unknown, fallback = 0): number {
